@@ -35,9 +35,9 @@ Status is PASS if ANE runs and ANE Corr > 0.99. Otherwise WARN or FAIL.
 
 ## The goal
 
-**Get the highest worst-case ANE Corr across all stages.** Higher correlation = better sounding audio.
+**Minimize ANE warm latency across all stages while keeping ANE Corr stable (> 0.99).** Faster inference = better user experience.
 
-Since the harness is fixed, you don't need to worry about evaluation — it's always the same. Everything in `scripts/export_coreml.py` is fair game: conversion options, monkey-patches, precision, model splitting, compute unit strategy. The only constraint is that all stages stay PASS (ANE Corr > 0.99).
+Since the harness is fixed, you don't need to worry about evaluation — it's always the same. Everything in `scripts/export_coreml.py` is fair game: conversion options, monkey-patches, precision, model splitting, compute unit strategy. The hard constraint is that all stages stay PASS (ANE Corr > 0.99) — correlation must not regress.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small speed improvement that adds ugly complexity is not worth it. Removing something and getting equal or better results is a great outcome. When evaluating whether to keep a change, weigh the complexity cost against the improvement.
 
@@ -71,8 +71,8 @@ LOOP FOREVER:
 4. git commit.
 5. Run: `.venv/bin/python scripts/stage_harness.py 2>&1 | tee research/run.log`
 6. Record in results.tsv.
-7. If total latency improved or accuracy improved (without regression): keep.
-8. If worse: `git reset --hard HEAD~1`.
+7. If ANE warm latency improved without correlation regression: keep.
+8. If slower or correlation regressed: `git reset --hard HEAD~1`.
 
 If a run crashes, use your judgment: fix trivial bugs and re-run, or skip the idea and move on.
 
