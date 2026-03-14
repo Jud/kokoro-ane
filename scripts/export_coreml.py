@@ -107,7 +107,7 @@ def patch_sinegen_for_export(model):
                 phase_scaled,
                 scale_factor=float(K),
                 mode='linear',
-                align_corners=False
+                align_corners=True
             )  # [B, D, N*K]
             phase = phase_up.transpose(1, 2)  # [B, N*K, D]
 
