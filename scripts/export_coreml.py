@@ -107,9 +107,14 @@ def patch_sinegen_for_export(model):
                 phase_scaled,
                 scale_factor=float(K),
                 mode='linear',
-                align_corners=False
+                align_corners=True
             )  # [B, D, N*K]
             phase = phase_up.transpose(1, 2)  # [B, N*K, D]
+
+            # Wrap phase to [0, 2π) — CoreML's sin() loses precision for
+            # large arguments (higher harmonics reach 25,000+ radians)
+            two_pi = 2.0 * torch.pi
+            phase = phase - two_pi * torch.floor(phase / two_pi)
 
             sines = torch.sin(phase)
 
