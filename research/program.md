@@ -28,7 +28,11 @@ Short sentence has ~0.02 noise from random phases. If medium/long PASS but short
 
 ## The goal
 
-**Get the highest worst-case ANE Corr across all stages.**
+**Phase 1 (DONE):** Get worst-case ANE Corr > 0.99 across all stages. ✅ Achieved — worst-case 0.9935.
+
+**Phase 2 (CURRENT):** Minimize ANE warm latency for stages 6/7/split_B without regressing ANE Corr below 0.99.
+
+Current bottleneck: the `correction_mask` in `CustomSTFT.transform()` forces the forward STFT subgraph to CPU fallback, making ANE execution ~4x slower than CPU-only (1400ms vs 340ms). The goal is to get ANE warm time **below CPU warm time** while keeping all stages PASS.
 
 Everything in `scripts/export_coreml.py` is fair game. All stages must stay PASS (ANE Corr > 0.99).
 
@@ -66,8 +70,8 @@ LOOP FOREVER:
 4. git commit.
 5. Run: `.venv/bin/python scripts/stage_harness.py 2>&1 | tee research/run.log`
 6. Record in results.tsv.
-7. If correlation improved or maintained without regression: keep.
-8. If worse: `git reset --hard HEAD~1`.
+7. If ANE latency improved without ANE Corr regressing below 0.99: keep.
+8. If ANE Corr drops below 0.99 on any sentence, or ANE latency worsens: `git reset --hard HEAD~1`.
 
 If a run crashes, fix trivial bugs and re-run, or skip the idea and move on.
 
