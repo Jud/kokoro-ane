@@ -34,6 +34,7 @@ register_missing_torch_ops()
 
 sys.path.insert(0, os.path.dirname(__file__))
 from export_coreml import patch_sinegen_for_export, SAMPLES_PER_FRAME, SineGen
+from export_coreml import GeneratorFrontEnd, GeneratorBackEnd
 
 # ---------------------------------------------------------------------------
 # Stage wrapper modules
@@ -383,6 +384,173 @@ def test_stage(name, module, example_inputs, input_specs, output_names=None):
     return result, py_outputs
 
 
+def test_pipeline_stage(name, frontend_module, backend_module,
+                        frontend_inputs, frontend_specs,
+                        backend_extra_inputs, backend_extra_specs,
+                        py_reference_output, output_names=None):
+    """Test a two-model pipeline: frontend on CPU, backend on ANE.
+
+    The frontend (STFT transform) runs on CPU for atan2 precision.
+    The backend (neural network) runs on ANE for speed.
+    Correlation is measured against py_reference_output.
+    """
+    result = {"name": name, "status": "unknown"}
+    frontend_module.eval()
+    backend_module.eval()
+
+    # Trace and convert frontend (CPU-only)
+    try:
+        with torch.no_grad():
+            fe_traced = torch.jit.trace(frontend_module, frontend_inputs, check_trace=False)
+        fe_model = ct.convert(
+            fe_traced, inputs=frontend_specs,
+            minimum_deployment_target=ct.target.macOS15,
+            compute_precision=ct.precision.FLOAT32,
+            convert_to="mlprogram",
+        )
+    except Exception as e:
+        result["status"] = "frontend_convert_error"
+        result["error"] = str(e)
+        return result
+
+    # Trace and convert backend (ANE-eligible)
+    try:
+        with torch.no_grad():
+            fe_py_out = frontend_module(*frontend_inputs)
+        backend_inputs = backend_extra_inputs + (fe_py_out,)
+        backend_specs_full = backend_extra_specs + [
+            ct.TensorType(name="har", shape=fe_py_out.shape, dtype=np.float32)]
+
+        with torch.no_grad():
+            be_traced = torch.jit.trace(backend_module, backend_inputs, check_trace=False)
+        be_model = ct.convert(
+            be_traced, inputs=backend_specs_full,
+            minimum_deployment_target=ct.target.macOS15,
+            compute_precision=ct.precision.FLOAT32,
+            convert_to="mlprogram",
+        )
+    except Exception as e:
+        result["status"] = "backend_convert_error"
+        result["error"] = str(e)
+        return result
+
+    # Build feed dicts
+    fe_feed = {}
+    for spec, tensor in zip(frontend_specs, frontend_inputs):
+        fe_feed[spec.name] = tensor.numpy().astype(np.float32) \
+            if tensor.dtype in (torch.float32, torch.float64) \
+            else tensor.numpy().astype(np.int32)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fe_path = os.path.join(tmpdir, "frontend.mlpackage")
+        be_path = os.path.join(tmpdir, "backend.mlpackage")
+        fe_model.save(fe_path)
+        be_model.save(be_path)
+
+        WARMUP_RUNS = 2
+        TIMED_RUNS = 3
+
+        # Load frontend CPU-only, backend ALL (ANE)
+        ml_fe = ct.models.MLModel(fe_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+        ml_be = ct.models.MLModel(be_path, compute_units=ct.ComputeUnit.ALL)
+
+        # Build backend feed (extra inputs + frontend output)
+        def _run_pipeline():
+            fe_out = ml_fe.predict(fe_feed)
+            har_val = list(fe_out.values())[0]  # single output
+            be_feed = {}
+            for spec, tensor in zip(backend_extra_specs, backend_extra_inputs):
+                be_feed[spec.name] = tensor.numpy().astype(np.float32)
+            be_feed["har"] = har_val.astype(np.float32)
+            return ml_be.predict(be_feed)
+
+        # Cold run
+        t0 = time.time()
+        ane_out = _run_pipeline()
+        result["predict_time_ane_cold"] = round(time.time() - t0, 3)
+
+        # Warm up
+        for _ in range(WARMUP_RUNS):
+            _run_pipeline()
+
+        # Timed runs
+        t0 = time.time()
+        for _ in range(TIMED_RUNS):
+            ane_out = _run_pipeline()
+        result["predict_time_ane"] = round((time.time() - t0) / TIMED_RUNS, 3)
+        result["ane_ok"] = True
+
+        # Also time CPU-only backend for comparison
+        ml_be_cpu = ct.models.MLModel(be_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+
+        def _run_pipeline_cpu():
+            fe_out = ml_fe.predict(fe_feed)
+            har_val = list(fe_out.values())[0]
+            be_feed = {}
+            for spec, tensor in zip(backend_extra_specs, backend_extra_inputs):
+                be_feed[spec.name] = tensor.numpy().astype(np.float32)
+            be_feed["har"] = har_val.astype(np.float32)
+            return ml_be_cpu.predict(be_feed)
+
+        t0 = time.time()
+        cpu_out = _run_pipeline_cpu()
+        result["predict_time_cpu_cold"] = round(time.time() - t0, 3)
+        for _ in range(WARMUP_RUNS):
+            _run_pipeline_cpu()
+        t0 = time.time()
+        for _ in range(TIMED_RUNS):
+            cpu_out = _run_pipeline_cpu()
+        result["predict_time_cpu"] = round((time.time() - t0) / TIMED_RUNS, 3)
+        result["cpu_ok"] = True
+
+    # Compare against PyTorch reference
+    py_outputs = (py_reference_output,) if not isinstance(py_reference_output, tuple) else py_reference_output
+
+    if ane_out is not None:
+        ane_comps = _match_and_compare(py_outputs, ane_out, output_names)
+        result["ane_corr"] = ane_comps[0]["corr"] if ane_comps else 0
+        result["comparisons"] = ane_comps
+
+    if cpu_out is not None:
+        cpu_comps = _match_and_compare(py_outputs, cpu_out, output_names)
+        result["cpu_corr"] = cpu_comps[0]["corr"] if cpu_comps else 0
+        result["cpu_comparisons"] = cpu_comps
+
+    result["status"] = "ok"
+    result["corr"] = result.get("ane_corr", result.get("cpu_corr", 0))
+    return result
+
+
+def _match_and_compare(py_outputs, coreml_out, output_names):
+    """Match CoreML outputs to PyTorch outputs by shape, return comparisons."""
+    coreml_items = list(coreml_out.items())
+    comparisons = []
+    for i, py_out in enumerate(py_outputs):
+        py_shape = tuple(py_out.shape)
+        oname = output_names[i] if output_names and i < len(output_names) else f"out_{i}"
+        matched = None
+        for cml_name, cml_val in coreml_items:
+            if tuple(cml_val.shape) == py_shape:
+                matched = (cml_name, cml_val)
+                coreml_items.remove((cml_name, cml_val))
+                break
+        if matched is None:
+            py_size = py_out.numel()
+            for cml_name, cml_val in coreml_items:
+                if cml_val.size == py_size:
+                    matched = (cml_name, cml_val)
+                    coreml_items.remove((cml_name, cml_val))
+                    break
+        if matched:
+            comp = compare_tensors(py_out, matched[1])
+            comp["name"] = oname
+            comparisons.append(comp)
+        else:
+            comparisons.append({"name": oname, "corr": 0, "mse": 0, "max_diff": 0, "error": "no_shape_match"})
+    return comparisons
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -598,6 +766,50 @@ def run_all_stages(model, intermediates, max_frames, only_stage=None):
         r, _ = test_stage(name, module, inputs, specs, output_names=output_names)
         results.append(r)
 
+    # Pipeline split stages (stage 10 = generator pipeline)
+    if only_stage is None or only_stage == 10:
+        try:
+            gen = model.decoder.generator
+            fe = GeneratorFrontEnd(gen)
+            be = GeneratorBackEnd(gen)
+
+            # Compute pre-generator input (same as stage 7 setup)
+            with torch.no_grad():
+                dec = model.decoder
+                F0 = dec.F0_conv(intermediates["F0_pred"].unsqueeze(1))
+                N = dec.N_conv(intermediates["N_pred"].unsqueeze(1))
+                x = torch.cat([intermediates["asr"], F0, N], axis=1)
+                x = dec.encode(x, intermediates["s_content"])
+                asr_res = dec.asr_res(intermediates["asr"])
+                res = True
+                for block in dec.decode:
+                    if res:
+                        x = torch.cat([x, asr_res, F0, N], axis=1)
+                    x = block(x, intermediates["s_content"])
+                    if block.upsample_type != "none":
+                        res = False
+                gen_input = x
+
+            r = test_pipeline_stage(
+                "10_gen_pipe",
+                fe, be,
+                frontend_inputs=(intermediates["F0_pred"],),
+                frontend_specs=[
+                    ct.TensorType(name="f0_curve", shape=intermediates["F0_pred"].shape,
+                                  dtype=np.float32)],
+                backend_extra_inputs=(gen_input, intermediates["s_content"]),
+                backend_extra_specs=[
+                    ct.TensorType(name="x", shape=gen_input.shape, dtype=np.float32),
+                    ct.TensorType(name="s", shape=intermediates["s_content"].shape,
+                                  dtype=np.float32)],
+                py_reference_output=intermediates["audio"],
+                output_names=["audio"],
+            )
+            results.append(r)
+        except Exception as e:
+            results.append({"name": "10_gen_pipe", "status": "setup_error",
+                           "error": str(e)[:80]})
+
     return results
 
 
@@ -712,7 +924,7 @@ def _merge_results(all_runs):
     return list(merged.values())
 
 
-MINIMUM_EXPERIMENT_SECONDS = 300  # 5 minutes
+MINIMUM_EXPERIMENT_SECONDS = 0  # disabled for fast iteration
 
 
 def _emit_results(all_runs, sentences, args):

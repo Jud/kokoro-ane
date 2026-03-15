@@ -202,6 +202,71 @@ class CustomSTFT(nn.Module):
 
 register_missing_torch_ops()
 
+
+# ---------------------------------------------------------------------------
+# Pipeline split modules for ANE-compatible decoder
+# ---------------------------------------------------------------------------
+class GeneratorFrontEnd(nn.Module):
+    """SineGen + STFT transform → har conditioning.
+
+    This portion contains atan2 + correction_mask which must run on CPU.
+    Split out so the rest of the generator can run on ANE.
+    """
+    def __init__(self, generator):
+        super().__init__()
+        self.f0_upsamp = generator.f0_upsamp
+        self.m_source = generator.m_source
+        self.stft = generator.stft
+
+    def forward(self, f0_curve):
+        f0 = self.f0_upsamp(f0_curve[:, None]).transpose(1, 2)
+        har_source, noi_source, uv = self.m_source(f0)
+        har_source = har_source.transpose(1, 2).squeeze(1)
+        har_spec, har_phase = self.stft.transform(har_source)
+        har = torch.cat([har_spec, har_phase], dim=1)
+        return har
+
+
+class GeneratorBackEnd(nn.Module):
+    """Upsampling cascade + inverse STFT → audio.
+
+    Takes precomputed har conditioning. No atan2 — runs fully on ANE.
+    """
+    def __init__(self, generator):
+        super().__init__()
+        self.num_upsamples = generator.num_upsamples
+        self.num_kernels = generator.num_kernels
+        self.noise_convs = generator.noise_convs
+        self.noise_res = generator.noise_res
+        self.ups = generator.ups
+        self.resblocks = generator.resblocks
+        self.reflection_pad = generator.reflection_pad
+        self.conv_post = generator.conv_post
+        self.post_n_fft = generator.post_n_fft
+        self.stft = generator.stft
+
+    def forward(self, x, s, har):
+        for i in range(self.num_upsamples):
+            x = F.leaky_relu(x, negative_slope=0.1)
+            x_source = self.noise_convs[i](har)
+            x_source = self.noise_res[i](x_source, s)
+            x = self.ups[i](x)
+            if i == self.num_upsamples - 1:
+                x = self.reflection_pad(x)
+            x = x + x_source
+            xs = None
+            for j in range(self.num_kernels):
+                if xs is None:
+                    xs = self.resblocks[i * self.num_kernels + j](x, s)
+                else:
+                    xs += self.resblocks[i * self.num_kernels + j](x, s)
+            x = xs / self.num_kernels
+        x = F.leaky_relu(x)
+        x = self.conv_post(x)
+        spec = torch.exp(x[:, :self.post_n_fft // 2 + 1, :])
+        phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
+        return self.stft.inverse(spec, phase)
+
 # ---------------------------------------------------------------------------
 # Model config
 # ---------------------------------------------------------------------------
@@ -238,6 +303,19 @@ def patch_sinegen_for_export(model):
 
     # Apply inlined _f02sine to the original class so existing instances use it
     OriginalSineGen._f02sine = SineGen._f02sine
+
+    # Patch forward to use deterministic noise (zeros instead of randn)
+    # so PyTorch reference and CoreML produce identical outputs.
+    _orig_forward = OriginalSineGen.forward
+    def _deterministic_forward(self, f0):
+        # Temporarily replace randn_like with zeros_like
+        _real_randn = torch.randn_like
+        torch.randn_like = torch.zeros_like
+        try:
+            return _orig_forward(self, f0)
+        finally:
+            torch.randn_like = _real_randn
+    OriginalSineGen.forward = _deterministic_forward
 
     # Helper to set external phases on all SineGen instances
     def set_phases(module, phases):
