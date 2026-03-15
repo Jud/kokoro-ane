@@ -34,7 +34,7 @@ register_missing_torch_ops()
 
 sys.path.insert(0, os.path.dirname(__file__))
 from export_coreml import patch_sinegen_for_export, SAMPLES_PER_FRAME, SineGen
-from export_coreml import GeneratorFrontEnd, GeneratorBackEnd
+from export_coreml import GeneratorFrontEnd, GeneratorBackEnd, DecoderBackEnd
 
 # ---------------------------------------------------------------------------
 # Stage wrapper modules
@@ -808,6 +808,36 @@ def run_all_stages(model, intermediates, max_frames, only_stage=None):
             results.append(r)
         except Exception as e:
             results.append({"name": "10_gen_pipe", "status": "setup_error",
+                           "error": str(e)[:80]})
+
+    # Stage 11: Full decoder pipeline (frontend CPU + decoder backend ANE)
+    if only_stage is None or only_stage == 11:
+        try:
+            gen = model.decoder.generator
+            fe = GeneratorFrontEnd(gen)
+            be = DecoderBackEnd(model.decoder)
+
+            r = test_pipeline_stage(
+                "11_dec_pipe",
+                fe, be,
+                frontend_inputs=(intermediates["F0_pred"],),
+                frontend_specs=[
+                    ct.TensorType(name="f0_curve", shape=intermediates["F0_pred"].shape,
+                                  dtype=np.float32)],
+                backend_extra_inputs=(
+                    intermediates["asr"], intermediates["F0_pred"],
+                    intermediates["N_pred"], intermediates["s_content"]),
+                backend_extra_specs=[
+                    ct.TensorType(name="asr", shape=intermediates["asr"].shape, dtype=np.float32),
+                    ct.TensorType(name="F0_curve", shape=intermediates["F0_pred"].shape, dtype=np.float32),
+                    ct.TensorType(name="N", shape=intermediates["N_pred"].shape, dtype=np.float32),
+                    ct.TensorType(name="s", shape=intermediates["s_content"].shape, dtype=np.float32)],
+                py_reference_output=intermediates["audio"],
+                output_names=["audio"],
+            )
+            results.append(r)
+        except Exception as e:
+            results.append({"name": "11_dec_pipe", "status": "setup_error",
                            "error": str(e)[:80]})
 
     return results

@@ -267,6 +267,38 @@ class GeneratorBackEnd(nn.Module):
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
         return self.stft.inverse(spec, phase)
 
+
+class DecoderBackEnd(nn.Module):
+    """Full decoder with precomputed har conditioning.
+
+    Decoder preprocessing (F0_conv, N_conv, encode, decode blocks) +
+    GeneratorBackEnd. No atan2 — runs fully on ANE.
+    """
+    def __init__(self, decoder):
+        super().__init__()
+        self.F0_conv = decoder.F0_conv
+        self.N_conv = decoder.N_conv
+        self.encode = decoder.encode
+        self.decode = decoder.decode
+        self.asr_res = decoder.asr_res
+        self.gen_backend = GeneratorBackEnd(decoder.generator)
+
+    def forward(self, asr, F0_curve, N, s, har):
+        F0 = self.F0_conv(F0_curve.unsqueeze(1))
+        N_out = self.N_conv(N.unsqueeze(1))
+        x = torch.cat([asr, F0, N_out], axis=1)
+        x = self.encode(x, s)
+        asr_res = self.asr_res(asr)
+        res = True
+        for block in self.decode:
+            if res:
+                x = torch.cat([x, asr_res, F0, N_out], axis=1)
+            x = block(x, s)
+            if block.upsample_type != "none":
+                res = False
+        return self.gen_backend(x, s, har)
+
+
 # ---------------------------------------------------------------------------
 # Model config
 # ---------------------------------------------------------------------------
