@@ -196,6 +196,94 @@ class CustomSTFT(nn.Module):
 
 register_missing_torch_ops()
 
+
+# ---------------------------------------------------------------------------
+# Pipeline split modules for ANE-compatible decoder
+# ---------------------------------------------------------------------------
+class GeneratorFrontEnd(nn.Module):
+    """SineGen + STFT transform -> har conditioning (runs on CPU).
+    Contains atan2 + correction_mask which must stay on CPU for precision."""
+    def __init__(self, generator):
+        super().__init__()
+        self.f0_upsamp = generator.f0_upsamp
+        self.m_source = generator.m_source
+        self.stft = generator.stft
+
+    def forward(self, f0_curve):
+        f0 = self.f0_upsamp(f0_curve[:, None]).transpose(1, 2)
+        har_source, noi_source, uv = self.m_source(f0)
+        har_source = har_source.transpose(1, 2).squeeze(1)
+        har_spec, har_phase = self.stft.transform(har_source)
+        return torch.cat([har_spec, har_phase], dim=1)
+
+
+class GeneratorBackEnd(nn.Module):
+    """Upsampling cascade + inverse STFT -> audio (runs on ANE).
+    Takes precomputed har conditioning. No atan2."""
+    def __init__(self, generator):
+        super().__init__()
+        self.num_upsamples = generator.num_upsamples
+        self.num_kernels = generator.num_kernels
+        self.noise_convs = generator.noise_convs
+        self.noise_res = generator.noise_res
+        self.ups = generator.ups
+        self.resblocks = generator.resblocks
+        self.reflection_pad = generator.reflection_pad
+        self.conv_post = generator.conv_post
+        self.post_n_fft = generator.post_n_fft
+        self.stft = generator.stft
+
+    def forward(self, x, s, har):
+        for i in range(self.num_upsamples):
+            x = F.leaky_relu(x, negative_slope=0.1)
+            x_source = self.noise_convs[i](har)
+            x_source = self.noise_res[i](x_source, s)
+            x = self.ups[i](x)
+            if i == self.num_upsamples - 1:
+                x = self.reflection_pad(x)
+            x = x + x_source
+            xs = None
+            for j in range(self.num_kernels):
+                if xs is None:
+                    xs = self.resblocks[i * self.num_kernels + j](x, s)
+                else:
+                    xs += self.resblocks[i * self.num_kernels + j](x, s)
+            x = xs / self.num_kernels
+        x = F.leaky_relu(x)
+        x = self.conv_post(x)
+        spec = torch.exp(x[:, :self.post_n_fft // 2 + 1, :])
+        phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
+        return self.stft.inverse(spec, phase)
+
+
+class DecoderBackEnd(nn.Module):
+    """Full decoder with precomputed har conditioning (runs on ANE).
+    Decoder preprocessing + GeneratorBackEnd. No atan2."""
+    def __init__(self, decoder):
+        super().__init__()
+        self.F0_conv = decoder.F0_conv
+        self.N_conv = decoder.N_conv
+        self.encode = decoder.encode
+        self.decode = decoder.decode
+        self.asr_res = decoder.asr_res
+        self.gen_backend = GeneratorBackEnd(decoder.generator)
+
+    def forward(self, asr, F0_curve, N, s, har):
+        F0 = self.F0_conv(F0_curve.unsqueeze(1))
+        N_out = self.N_conv(N.unsqueeze(1))
+        x = torch.cat([asr, F0, N_out], axis=1)
+        x = self.encode(x, s)
+        asr_res = self.asr_res(asr)
+        res = True
+        for block in self.decode:
+            if res:
+                x = torch.cat([x, asr_res, F0, N_out], axis=1)
+            x = block(x, s)
+            if block.upsample_type != "none":
+                res = False
+        return self.gen_backend(x, s, har)
+
+
 # ---------------------------------------------------------------------------
 # Model config
 # ---------------------------------------------------------------------------
