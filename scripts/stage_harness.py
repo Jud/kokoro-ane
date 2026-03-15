@@ -206,11 +206,17 @@ class SplitB_Decoder(nn.Module):
 # Test runner
 # ---------------------------------------------------------------------------
 
-def compare_tensors(py_out, coreml_out):
-    """Compare PyTorch and CoreML output tensors."""
+def compare_tensors(py_out, coreml_out, active_length=None):
+    """Compare PyTorch and CoreML output tensors.
+
+    If active_length is set, compare only the first active_length samples
+    (ignores garbage tail from fixed-size audio output).
+    """
     py_np = py_out.numpy().flatten() if isinstance(py_out, torch.Tensor) else py_out.flatten()
     cml_np = coreml_out.flatten()
     ml = min(len(py_np), len(cml_np))
+    if active_length is not None:
+        ml = min(ml, active_length)
     if ml == 0:
         return {"corr": 0, "mse": 0, "max_diff": 0, "shape_match": False}
 
@@ -228,7 +234,7 @@ def compare_tensors(py_out, coreml_out):
     return {"corr": corr, "mse": mse, "max_diff": max_diff, "len": ml}
 
 
-def test_stage(name, module, example_inputs, input_specs, output_names=None):
+def test_stage(name, module, example_inputs, input_specs, output_names=None, active_length=None):
     """Trace, convert, and compare a single stage.
 
     Returns dict with metrics or error info.
@@ -336,7 +342,7 @@ def test_stage(name, module, example_inputs, input_specs, output_names=None):
         result["error"] = "both ANE and CPU failed"
         return result, py_outputs
 
-    def _match_and_compare(py_outputs, coreml_out, output_names):
+    def _match_and_compare(py_outputs, coreml_out, output_names, active_length=None):
         """Match CoreML outputs to PyTorch outputs by shape, return comparisons."""
         coreml_items = list(coreml_out.items())
         comparisons = []
@@ -357,7 +363,9 @@ def test_stage(name, module, example_inputs, input_specs, output_names=None):
                         coreml_items.remove((cml_name, cml_val))
                         break
             if matched:
-                comp = compare_tensors(py_out, matched[1])
+                # Use active_length for first output (audio) only
+                al = active_length if i == 0 else None
+                comp = compare_tensors(py_out, matched[1], active_length=al)
                 comp["name"] = oname
                 comparisons.append(comp)
             else:
@@ -366,13 +374,13 @@ def test_stage(name, module, example_inputs, input_specs, output_names=None):
 
     # PyTorch vs CPU
     if cpu_out is not None:
-        cpu_comps = _match_and_compare(py_outputs, cpu_out, output_names)
+        cpu_comps = _match_and_compare(py_outputs, cpu_out, output_names, active_length=active_length)
         result["cpu_corr"] = cpu_comps[0]["corr"] if cpu_comps else 0
         result["cpu_comparisons"] = cpu_comps
 
     # PyTorch vs ANE
     if ane_out is not None:
-        ane_comps = _match_and_compare(py_outputs, ane_out, output_names)
+        ane_comps = _match_and_compare(py_outputs, ane_out, output_names, active_length=active_length)
         result["ane_corr"] = ane_comps[0]["corr"] if ane_comps else 0
         result["comparisons"] = ane_comps  # primary comparisons = ANE
     elif cpu_out is not None:
@@ -387,7 +395,8 @@ def test_stage(name, module, example_inputs, input_specs, output_names=None):
 def test_pipeline_stage(name, frontend_module, backend_module,
                         frontend_inputs, frontend_specs,
                         backend_extra_inputs, backend_extra_specs,
-                        py_reference_output, output_names=None):
+                        py_reference_output, output_names=None,
+                        active_length=None):
     """Test a two-model pipeline: frontend on CPU, backend on ANE.
 
     The frontend (STFT transform) runs on CPU for atan2 precision.
@@ -508,12 +517,12 @@ def test_pipeline_stage(name, frontend_module, backend_module,
     py_outputs = (py_reference_output,) if not isinstance(py_reference_output, tuple) else py_reference_output
 
     if ane_out is not None:
-        ane_comps = _match_and_compare(py_outputs, ane_out, output_names)
+        ane_comps = _match_and_compare(py_outputs, ane_out, output_names, active_length=active_length)
         result["ane_corr"] = ane_comps[0]["corr"] if ane_comps else 0
         result["comparisons"] = ane_comps
 
     if cpu_out is not None:
-        cpu_comps = _match_and_compare(py_outputs, cpu_out, output_names)
+        cpu_comps = _match_and_compare(py_outputs, cpu_out, output_names, active_length=active_length)
         result["cpu_corr"] = cpu_comps[0]["corr"] if cpu_comps else 0
         result["cpu_comparisons"] = cpu_comps
 
@@ -522,7 +531,7 @@ def test_pipeline_stage(name, frontend_module, backend_module,
     return result
 
 
-def _match_and_compare(py_outputs, coreml_out, output_names):
+def _match_and_compare(py_outputs, coreml_out, output_names, active_length=None):
     """Match CoreML outputs to PyTorch outputs by shape, return comparisons."""
     coreml_items = list(coreml_out.items())
     comparisons = []
@@ -543,7 +552,8 @@ def _match_and_compare(py_outputs, coreml_out, output_names):
                     coreml_items.remove((cml_name, cml_val))
                     break
         if matched:
-            comp = compare_tensors(py_out, matched[1])
+            al = active_length if i == 0 else None
+            comp = compare_tensors(py_out, matched[1], active_length=al)
             comp["name"] = oname
             comparisons.append(comp)
         else:
@@ -755,6 +765,11 @@ def run_all_stages(model, intermediates, max_frames, only_stage=None):
     configs = _build_stage_configs(model, intermediates, max_frames)
     results = []
 
+    # Active audio length for trimming garbage tail in correlation
+    active_audio = int(intermediates["total_frames"].item()) * SAMPLES_PER_FRAME
+    # Stages that output audio (6=decoder, 7=generator, 9=split_B)
+    audio_stages = {6, 7, 9}
+
     for stage_num, name, module, inputs, specs, output_names in configs:
         if only_stage is not None and only_stage != stage_num:
             continue
@@ -763,7 +778,8 @@ def run_all_stages(model, intermediates, max_frames, only_stage=None):
             results.append({"name": name, "status": "setup_error", "error": "failed to build"})
             continue
 
-        r, _ = test_stage(name, module, inputs, specs, output_names=output_names)
+        al = active_audio if stage_num in audio_stages else None
+        r, _ = test_stage(name, module, inputs, specs, output_names=output_names, active_length=al)
         results.append(r)
 
     # Pipeline split stages (stage 10 = generator pipeline)
@@ -804,6 +820,7 @@ def run_all_stages(model, intermediates, max_frames, only_stage=None):
                                   dtype=np.float32)],
                 py_reference_output=intermediates["audio"],
                 output_names=["audio"],
+                active_length=active_audio,
             )
             results.append(r)
         except Exception as e:
@@ -834,6 +851,7 @@ def run_all_stages(model, intermediates, max_frames, only_stage=None):
                     ct.TensorType(name="s", shape=intermediates["s_content"].shape, dtype=np.float32)],
                 py_reference_output=intermediates["audio"],
                 output_names=["audio"],
+                active_length=active_audio,
             )
             results.append(r)
         except Exception as e:
