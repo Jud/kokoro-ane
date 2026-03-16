@@ -308,6 +308,33 @@ def patch_pack_padded_sequence():
     nn.utils.rnn.pad_packed_sequence = lambda x, **kw: (x, None)
 
 
+def _patch_snake_mul(model):
+    """Replace pow(sin(x), 2) with sin(x) * sin(x) in Snake activations.
+
+    pow is not in ANE's native op list. Explicit mul is ANE-native
+    and avoids the pow decomposition overhead.
+    """
+    from kokoro.istftnet import AdaINResBlock1
+
+    def _snake_mul_forward(self, x, s):
+        for c1, c2, n1, n2, a1, a2 in zip(
+            self.convs1, self.convs2, self.adain1, self.adain2,
+            self.alpha1, self.alpha2
+        ):
+            xt = n1(x, s)
+            s1 = torch.sin(a1 * xt)
+            xt = xt + (1.0 / a1) * (s1 * s1)
+            xt = c1(xt)
+            xt = n2(xt, s)
+            s2 = torch.sin(a2 * xt)
+            xt = xt + (1.0 / a2) * (s2 * s2)
+            xt = c2(xt)
+            x = xt + x
+        return x
+
+    AdaINResBlock1.forward = _snake_mul_forward
+
+
 def patch_sinegen_for_export(model):
     """Apply inlined SineGen to the model and return a phases helper.
 
@@ -330,6 +357,9 @@ def patch_sinegen_for_export(model):
         finally:
             torch.randn_like = _real_randn
     OriginalSineGen.forward = _deterministic_forward
+
+    # Replace pow(sin,2) with mul in Snake activations
+    _patch_snake_mul(model)
 
     # Set external phases on all SineGen instances
     def set_phases(module, phases):
