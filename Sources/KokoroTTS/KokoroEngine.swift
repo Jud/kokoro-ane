@@ -1,4 +1,5 @@
 import Accelerate
+import AVFoundation
 import CoreML
 import Foundation
 import os
@@ -68,7 +69,12 @@ public final class KokoroEngine: @unchecked Sendable {
     /// Number of random phase channels for the iSTFTNet vocoder.
     private static let numPhases = 9
 
-    // CoreML model input/output feature names.
+    /// Safety margin subtracted from max bucket tokens when chunking phonemes.
+    private static let tokenPadding = 7
+
+    /// Silence samples inserted between chunks (100ms at 24kHz).
+    private static let interChunkSilence = 2400
+
     private enum Feature {
         static let inputIds = "input_ids"
         static let attentionMask = "attention_mask"
@@ -192,41 +198,9 @@ public final class KokoroEngine: @unchecked Sendable {
         bucket: ModelBucket? = nil, rawAudio: Bool = false
     ) throws -> SynthesisResult {
         let t0 = CFAbsoluteTimeGetCurrent()
-        let clampedSpeed = min(max(speed, Self.speedRange.lowerBound), Self.speedRange.upperBound)
+        let clampedSpeed = Self.clampSpeed(speed)
+        let (fullPhonemes, mergedIds) = prepareChunks(text: text)
 
-        // 1. Split on paragraph boundaries, phonemize each, join.
-        let paragraphs = text.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        let fullPhonemes: String
-        if paragraphs.count <= 1 {
-            fullPhonemes = lockedPhonemize(text)
-        } else {
-            fullPhonemes = paragraphs.map { lockedPhonemize($0) }.joined(separator: " ")
-        }
-
-        // 2. Chunk phoneme stream at punctuation boundaries, then encode.
-        let maxTokens = activeBuckets.last!.maxTokens
-        let chunks = Self.chunkPhonemes(fullPhonemes, maxPhonemes: maxTokens - 2)
-        let tokenized = chunks.map { tokenizer.encode($0) }
-
-        // 3. Merge consecutive short chunks that fit in one bucket.
-        var mergedIds: [[Int]] = []
-        var currentIds: [Int] = []
-        for ids in tokenized {
-            let combined = currentIds.isEmpty
-                ? ids
-                : Array(currentIds.dropLast()) + Array(ids.dropFirst())
-            if combined.count <= maxTokens {
-                currentIds = combined
-            } else {
-                if !currentIds.isEmpty { mergedIds.append(currentIds) }
-                currentIds = ids
-            }
-        }
-        if !currentIds.isEmpty { mergedIds.append(currentIds) }
-
-        // 4. Synthesize each merged chunk.
         var allSamples: [Float] = []
         var allDurations: [Int] = []
         var totalTokens = 0
@@ -255,7 +229,7 @@ public final class KokoroEngine: @unchecked Sendable {
 
             applyFades(&samples)
             if !allSamples.isEmpty {
-                allSamples.append(contentsOf: [Float](repeating: 0, count: 2400))
+                allSamples.append(contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
             }
             allSamples.append(contentsOf: samples)
             allDurations.append(contentsOf: durations)
@@ -302,6 +276,44 @@ public final class KokoroEngine: @unchecked Sendable {
 
     // MARK: - Private
 
+    private static func clampSpeed(_ speed: Float) -> Float {
+        min(max(speed, speedRange.lowerBound), speedRange.upperBound)
+    }
+
+    /// Phonemize, chunk, tokenize, and merge text into batches of token IDs.
+    private func prepareChunks(text: String) -> (phonemes: String, mergedTokenIds: [[Int]]) {
+        let paragraphs = text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let fullPhonemes: String
+        if paragraphs.count <= 1 {
+            fullPhonemes = lockedPhonemize(text)
+        } else {
+            fullPhonemes = paragraphs.map { lockedPhonemize($0) }.joined(separator: " ")
+        }
+
+        let maxTokens = activeBuckets.last!.maxTokens
+        let chunks = Self.chunkPhonemes(fullPhonemes, maxPhonemes: maxTokens - Self.tokenPadding)
+        let tokenized = chunks.map { tokenizer.encode($0) }
+
+        var mergedIds: [[Int]] = []
+        var currentIds: [Int] = []
+        for ids in tokenized {
+            let combined = currentIds.isEmpty
+                ? ids
+                : Array(currentIds.dropLast()) + Array(ids.dropFirst())
+            if combined.count <= maxTokens {
+                currentIds = combined
+            } else {
+                if !currentIds.isEmpty { mergedIds.append(currentIds) }
+                currentIds = ids
+            }
+        }
+        if !currentIds.isEmpty { mergedIds.append(currentIds) }
+
+        return (fullPhonemes, mergedIds)
+    }
+
     private func lockedPhonemize(_ text: String) -> String {
         g2pLock.lock()
         defer { g2pLock.unlock() }
@@ -330,7 +342,6 @@ public final class KokoroEngine: @unchecked Sendable {
             let window = remaining.prefix(maxPhonemes)
             var splitIndex: String.Index?
 
-            // Waterfall: try each punctuation set, picking the last occurrence.
             for punctSet in waterfallSets {
                 if let idx = window.lastIndex(where: { punctSet.contains($0) }) {
                     splitIndex = window.index(after: idx)
@@ -338,14 +349,12 @@ public final class KokoroEngine: @unchecked Sendable {
                 }
             }
 
-            // Fallback: split at last space.
             if splitIndex == nil {
                 if let idx = window.lastIndex(of: " ") {
                     splitIndex = window.index(after: idx)
                 }
             }
 
-            // Last resort: hard split at max.
             let cut = splitIndex ?? window.endIndex
             let chunk = String(remaining[remaining.startIndex..<cut])
                 .trimmingCharacters(in: .whitespaces)
@@ -387,7 +396,6 @@ public final class KokoroEngine: @unchecked Sendable {
 
         res.speed[0] = speed as NSNumber
 
-        // Only include speed input if the model accepts it (speed-injected models).
         var dict: [String: MLFeatureValue] = [
             Feature.inputIds: MLFeatureValue(multiArray: res.inputIds),
             Feature.attentionMask: MLFeatureValue(multiArray: res.mask),
@@ -413,7 +421,6 @@ public final class KokoroEngine: @unchecked Sendable {
             throw KokoroError.inferenceFailed("Missing audio output")
         }
 
-        // Models with speed output pred_dur_clamped; without speed output pred_dur.
         let durations: [Int]
         let predDur = output.featureValue(for: Feature.predDurClamped)?.multiArrayValue
             ?? output.featureValue(for: Feature.predDur)?.multiArrayValue
@@ -423,7 +430,6 @@ public final class KokoroEngine: @unchecked Sendable {
             durations = []
         }
 
-        // Prefer model's own audio_length_samples output (exact); fall back to pred_dur * hopSize.
         let validSamples: Int
         if let lengthArray = output.featureValue(for: Feature.audioLength)?.multiArrayValue,
             lengthArray[0].intValue > 0, lengthArray[0].intValue <= audio.count
@@ -445,13 +451,11 @@ public final class KokoroEngine: @unchecked Sendable {
         guard samples.count > 0 else { return }
         samples.withUnsafeMutableBufferPointer { buf in
             let ptr = buf.baseAddress!
-            // Fade-in: 5ms ramp 0→1 to suppress onset transient.
-            let fadeIn = min(120, buf.count)
+            let fadeIn = min(120, buf.count)  // 5ms
             var ramp: Float = 0
             var step = 1.0 / Float(fadeIn)
             vDSP_vrampmul(ptr, 1, &ramp, &step, ptr, 1, vDSP_Length(fadeIn))
-            // Fade-out: 50ms ramp 1→0 for natural ending.
-            let fadeOut = min(1200, buf.count)
+            let fadeOut = min(1200, buf.count)  // 50ms
             let fadeStart = buf.count - fadeOut
             ramp = 1.0
             step = -1.0 / Float(fadeOut)
@@ -482,15 +486,128 @@ public final class KokoroEngine: @unchecked Sendable {
     // Precomputed high-pass filter coefficient: alpha = 1 - (2π * 80Hz / sampleRate)
     private static let hpAlpha: Float = 1.0 - (2.0 * .pi * 80.0 / Float(sampleRate))
 
+    // MARK: - Streaming
+
+    /// Audio format for streaming buffers (24kHz, mono, float32).
+    ///
+    /// Use this to configure your `AVAudioEngine` for playback:
+    /// ```swift
+    /// audioEngine.connect(playerNode, to: audioEngine.mainMixerNode,
+    ///                     format: KokoroEngine.audioFormat)
+    /// ```
+    public static let audioFormat = AVAudioFormat(
+        standardFormatWithSampleRate: Double(sampleRate), channels: 1)!
+
+    /// Stream synthesized audio as playback-ready buffers.
+    ///
+    /// Automatically chunks long text and yields each segment as an
+    /// `AVAudioPCMBuffer` ready for `AVAudioPlayerNode.scheduleBuffer()`.
+    /// Consumers just iterate and play — no manual chunking or PCM handling needed.
+    ///
+    /// ```swift
+    /// for await buffer in try engine.speak("Long text...", voice: "af_heart") {
+    ///     playerNode.scheduleBuffer(buffer)
+    /// }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - text: Text to speak (any length — automatically chunked).
+    ///   - voice: Voice preset name (e.g. `"af_heart"`).
+    ///   - speed: Speech rate multiplier (0.5–2.0). Default 1.0.
+    /// - Returns: Stream of playback-ready 24kHz mono audio buffers.
+    /// - Throws: ``KokoroError/voiceNotFound(_:)`` if the voice doesn't exist.
+    public func speak(
+        _ text: String,
+        voice: String,
+        speed: Float = 1.0
+    ) throws -> AsyncStream<AVAudioPCMBuffer> {
+        guard availableVoices.contains(voice) else {
+            throw KokoroError.voiceNotFound(voice)
+        }
+
+        let clampedSpeed = Self.clampSpeed(speed)
+
+        return AsyncStream { continuation in
+            let task = Task {
+                let (_, mergedIds) = self.prepareChunks(text: text)
+                guard !mergedIds.isEmpty else {
+                    continuation.finish()
+                    return
+                }
+
+                let format = Self.audioFormat
+                var isFirst = true
+
+                for tokenIds in mergedIds {
+                    guard !Task.isCancelled else { break }
+
+                    do {
+                        let styleVector = try self.voiceStore.embedding(
+                            for: voice, tokenCount: tokenIds.count - 2)
+                        let bucket =
+                            ModelBucket.select(
+                                forTokenCount: tokenIds.count, available: self.activeBuckets)
+                            ?? self.activeBuckets.last!
+
+                        var (samples, _) = try self.synthesizeUnified(
+                            tokenIds: tokenIds, styleVector: styleVector,
+                            speed: clampedSpeed, bucket: bucket)
+
+                        self.applyFades(&samples)
+                        self.postProcess(&samples)
+
+                        if !isFirst,
+                            let gap = Self.makePCMBuffer(
+                                from: [Float](repeating: 0, count: Self.interChunkSilence),
+                                format: format)
+                        {
+                            continuation.yield(gap)
+                        }
+
+                        if let buffer = Self.makePCMBuffer(from: samples, format: format) {
+                            continuation.yield(buffer)
+                        }
+                        isFirst = false
+                    } catch {
+                        Self.logger.error(
+                            "Streaming chunk failed: \(error.localizedDescription)")
+                    }
+                }
+
+                continuation.finish()
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    /// Convert float samples to a playback-ready `AVAudioPCMBuffer`.
+    public static func makePCMBuffer(
+        from samples: [Float], format: AVAudioFormat
+    ) -> AVAudioPCMBuffer? {
+        guard !samples.isEmpty else { return nil }
+        guard
+            let buffer = AVAudioPCMBuffer(
+                pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count))
+        else { return nil }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { src in
+            guard let dst = buffer.floatChannelData?[0], let srcBase = src.baseAddress
+            else { return }
+            dst.update(from: srcBase, count: samples.count)
+        }
+        return buffer
+    }
+
     /// Post-process audio in-place: high-pass filter, presence boost, peak normalize.
     private func postProcess(_ samples: inout [Float]) {
         guard samples.count > 1 else { return }
 
-        // 1. DC offset removal + high-pass at ~80Hz (single-pole IIR)
         let alpha = Self.hpAlpha
         let prechargeCount = min(240, samples.count)  // 10ms at 24kHz
 
-        // Pre-charge: run filter backwards on first 10ms to warm up state
         var prev: Float = 0
         var prevOut: Float = 0
         for i in stride(from: prechargeCount - 1, through: 0, by: -1) {
@@ -499,7 +616,6 @@ public final class KokoroEngine: @unchecked Sendable {
             prev = x
         }
 
-        // Forward pass with warmed-up state
         for i in 0..<samples.count {
             let x = samples[i]
             prevOut = (x - prev) + alpha * prevOut
@@ -507,10 +623,8 @@ public final class KokoroEngine: @unchecked Sendable {
             samples[i] = prevOut
         }
 
-        // 2. Presence boost biquad
         let c = Self.eqCoeffs
 
-        // Pre-charge biquad on reversed first 10ms
         var x1: Float = 0, x2: Float = 0, y1: Float = 0, y2: Float = 0
         for i in stride(from: prechargeCount - 1, through: 0, by: -1) {
             let x = samples[i]
@@ -519,7 +633,6 @@ public final class KokoroEngine: @unchecked Sendable {
             y2 = y1; y1 = y
         }
 
-        // Forward pass with warmed-up state
         for i in 0..<samples.count {
             let x = samples[i]
             let y = c.nb0 * x + c.nb1 * x1 + c.nb2 * x2 - c.na1 * y1 - c.na2 * y2
@@ -528,7 +641,6 @@ public final class KokoroEngine: @unchecked Sendable {
             samples[i] = y
         }
 
-        // 3. Peak normalize to 0.95 (-0.5dBFS)
         var peak: Float = 0
         vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
         if peak > 0.001 {

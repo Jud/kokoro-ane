@@ -34,6 +34,9 @@ struct KokoroSay: ParsableCommand {
     @Flag(name: .long, help: "Skip audio post-processing")
     var raw = false
 
+    @Flag(name: .long, help: "Stream audio (start playback before full synthesis)")
+    var stream = false
+
     @Flag(name: .long, help: "Print debug information")
     var debug = false
 
@@ -44,12 +47,12 @@ struct KokoroSay: ParsableCommand {
     var text: [String] = []
 
     func validate() throws {
-        guard (0.5...2.0).contains(speed) else {
-            throw ValidationError("Speed must be between 0.5 and 2.0")
+        guard KokoroEngine.speedRange.contains(speed) else {
+            throw ValidationError("Speed must be between \(KokoroEngine.speedRange.lowerBound) and \(KokoroEngine.speedRange.upperBound)")
         }
     }
 
-    mutating func run() throws {
+    mutating func run() async throws {
         let dir: URL
         if let modelDir {
             dir = URL(fileURLWithPath: modelDir)
@@ -85,27 +88,31 @@ struct KokoroSay: ParsableCommand {
             print("Loaded buckets: \(engine.activeBuckets.map(\.modelName).joined(separator: ", "))")
         }
 
-        let result = try engine.synthesize(
-            text: inputText, voice: voice, speed: speed,
-            bucket: bucket, rawAudio: raw
-        )
+        if stream && output == nil {
+            try await streamPlayback(engine: engine, text: inputText)
+        } else {
+            let result = try engine.synthesize(
+                text: inputText, voice: voice, speed: speed,
+                bucket: bucket, rawAudio: raw
+            )
 
-        if debug { printDebugInfo(result: result) }
+            if debug { printDebugInfo(result: result) }
 
-        let tag = result.bucket.map { " \($0.modelName)" } ?? ""
-        let stats = String(
-            format: "%.0fms synth, %.1fs audio, %.1fx RT",
-            result.synthesisTime * 1000, result.duration, result.realTimeFactor
-        )
-        print("[\(voice)\(tag)] \(stats)")
+            let tag = result.bucket.map { " \($0.modelName)" } ?? ""
+            let stats = String(
+                format: "%.0fms synth, %.1fs audio, %.1fx RT",
+                result.synthesisTime * 1000, result.duration, result.realTimeFactor
+            )
+            print("[\(voice)\(tag)] \(stats)")
 
-        if let output {
-            try writeWAV(samples: result.samples, to: output)
-            print("Wrote \(output)")
-        }
+            if let output {
+                try writeWAV(samples: result.samples, to: output)
+                print("Wrote \(output)")
+            }
 
-        if play || (output == nil && !debug) {
-            try playAudio(samples: result.samples)
+            if play || (output == nil && !debug) {
+                try playAudio(samples: result.samples)
+            }
         }
     }
 
@@ -133,20 +140,14 @@ struct KokoroSay: ParsableCommand {
 
     // MARK: - Audio Helpers
 
-    private func makePCMBuffer(
-        from samples: [Float], format: AVAudioFormat
-    ) throws -> AVAudioPCMBuffer {
-        guard let buf = AVAudioPCMBuffer(
-            pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)
-        ) else {
-            fputs("Failed to create audio buffer\n", stderr)
-            throw ExitCode.failure
-        }
-        buf.frameLength = AVAudioFrameCount(samples.count)
-        samples.withUnsafeBufferPointer { src in
-            buf.floatChannelData![0].update(from: src.baseAddress!, count: samples.count)
-        }
-        return buf
+    private func startAudioPlayer() throws -> (AVAudioEngine, AVAudioPlayerNode) {
+        let audioEngine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        audioEngine.attach(player)
+        audioEngine.connect(player, to: audioEngine.mainMixerNode, format: KokoroEngine.audioFormat)
+        try audioEngine.start()
+        player.play()
+        return (audioEngine, player)
     }
 
     private func writeWAV(samples: [Float], to path: String) throws {
@@ -160,31 +161,60 @@ struct KokoroSay: ParsableCommand {
             AVLinearPCMIsBigEndianKey: false,
         ]
         let file = try AVAudioFile(forWriting: url, settings: settings)
-        let buf = try makePCMBuffer(from: samples, format: file.processingFormat)
+        guard let buf = KokoroEngine.makePCMBuffer(from: samples, format: file.processingFormat)
+        else {
+            fputs("Failed to create audio buffer\n", stderr)
+            throw ExitCode.failure
+        }
         try file.write(from: buf)
     }
 
     private func playAudio(samples: [Float]) throws {
-        let audioEngine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        guard let format = AVAudioFormat(
-            standardFormatWithSampleRate: Double(KokoroEngine.sampleRate), channels: 1
-        ) else {
-            fputs("Failed to create audio format\n", stderr)
+        let (audioEngine, player) = try startAudioPlayer()
+        defer { audioEngine.stop() }
+
+        guard let buf = KokoroEngine.makePCMBuffer(from: samples, format: KokoroEngine.audioFormat)
+        else {
+            fputs("Failed to create audio buffer\n", stderr)
             throw ExitCode.failure
         }
-        audioEngine.attach(player)
-        audioEngine.connect(player, to: audioEngine.mainMixerNode, format: format)
-        try audioEngine.start()
-        defer { audioEngine.stop() }
-        player.play()
-
-        let buf = try makePCMBuffer(from: samples, format: format)
         let done = DispatchSemaphore(value: 0)
         player.scheduleBuffer(buf) { done.signal() }
         done.wait()
-        // Allow audio hardware buffer to flush
         Thread.sleep(forTimeInterval: 0.1)
+    }
+
+    // MARK: - Streaming
+
+    private func streamPlayback(engine: KokoroEngine, text: String) async throws {
+        let (audioEngine, player) = try startAudioPlayer()
+        defer { audioEngine.stop() }
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        var chunks = 0
+        var totalFrames: AVAudioFrameCount = 0
+        var reportedFirst = false
+
+        for await buffer in try engine.speak(text, voice: voice, speed: speed) {
+            chunks += 1
+            totalFrames += buffer.frameLength
+            player.scheduleBuffer(buffer, completionHandler: nil)
+            if !reportedFirst {
+                reportedFirst = true
+                let latency = CFAbsoluteTimeGetCurrent() - t0
+                print("[\(voice)] first audio in \(Int(latency * 1000))ms")
+            }
+        }
+
+        let duration = Double(totalFrames) / Double(KokoroEngine.sampleRate)
+        let elapsed = CFAbsoluteTimeGetCurrent() - t0
+        print("[\(voice)] \(chunks) chunks, \(String(format: "%.1f", duration))s audio, \(Int(elapsed * 1000))ms total synth")
+
+        let sentinel = AVAudioPCMBuffer(pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)!
+        sentinel.frameLength = 1
+        sentinel.floatChannelData?[0].pointee = 0
+        await player.scheduleBuffer(sentinel)
+        try await Task.sleep(for: .milliseconds(100))
     }
 
     // MARK: - Debug
