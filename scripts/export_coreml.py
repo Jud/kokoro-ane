@@ -171,7 +171,7 @@ class CustomSTFT(nn.Module):
                             stride=self.hop_length, padding=0)
         imag_out = F.conv1d(x, self.weight_forward_imag, bias=None,
                             stride=self.hop_length, padding=0)
-        magnitude = torch.sqrt(real_out**2 + imag_out**2 + 1e-14)
+        magnitude = torch.sqrt(real_out * real_out + imag_out * imag_out + 1e-14)
         phase = torch.atan2(imag_out, real_out)
         correction_mask = (imag_out == 0) & (real_out < 0)
         phase[correction_mask] = torch.pi
