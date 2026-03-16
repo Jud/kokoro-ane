@@ -10,12 +10,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  XCODE_PATH: /Applications/Xcode_16.3.app
+
 jobs:
   format:
     name: Format
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s ${{ env.XCODE_PATH }}
       - name: Check formatting
         run: swift format lint --strict --ignore-unparsable-files --recursive Sources Tests
 
@@ -24,6 +29,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s ${{ env.XCODE_PATH }}
       - uses: actions/cache@v4
         with:
           path: .build
@@ -39,6 +46,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s ${{ env.XCODE_PATH }}
       - uses: actions/cache@v4
         with:
           path: .build
@@ -66,6 +75,7 @@ jobs:
 
       - name: Run benchmarks
         run: |
+          set -o pipefail
           swift test --filter "Performance|InferenceBenchmark" 2>&1 | tee benchmark-output.txt
 
       - name: Summary
