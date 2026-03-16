@@ -22,72 +22,28 @@ import torch.nn.functional as F
 import coremltools as ct
 from coreml_ops import register_missing_torch_ops
 
-# SineGen inlined from kokoro.istftnet with CoreML-compatible _f02sine.
+# CoreML-compatible _f02sine for SineGen.
+# Only _f02sine is used — it gets monkey-patched onto the original SineGen class.
+# The original __init__, _f02uv, and forward are kept on the original class.
 
-class SineGen(nn.Module):
-    def __init__(self, samp_rate, upsample_scale, harmonic_num=0,
-                 sine_amp=0.1, noise_std=0.003,
-                 voiced_threshold=0, flag_for_pulse=False):
-        super().__init__()
-        self.sine_amp = sine_amp
-        self.noise_std = noise_std
-        self.harmonic_num = harmonic_num
-        self.dim = self.harmonic_num + 1
-        self.sampling_rate = samp_rate
-        self.voiced_threshold = voiced_threshold
-        self.flag_for_pulse = flag_for_pulse
-        self.upsample_scale = upsample_scale
-
-    def _f02uv(self, f0):
-        uv = (f0 > self.voiced_threshold).type(torch.float32)
-        return uv
-
+class SineGen:
+    @staticmethod
     def _f02sine(self, f0_values):
-        # Instantaneous frequency as fraction of sample rate
-        # Fractional part of instantaneous frequency
+        """CoreML-compatible phase computation: fractional freq → pool → cumsum → interpolate → sin."""
         val = f0_values / self.sampling_rate
         rad_values = val - torch.floor(val)
-
-        # Random initial phase
-        if hasattr(self, '_external_phases') and self._external_phases is not None:
-            rand_ini = self._external_phases[:, :f0_values.shape[2]]
-        else:
-            rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2],
-                                  device=f0_values.device)
-
-        # Zero fundamental's phase offset
-        rand_ini = torch.cat([
-            torch.zeros(rand_ini.shape[0], 1, device=rand_ini.device),
-            rand_ini[:, 1:]
-        ], dim=1)
-
-        # Add phase offset to first time step
-        offset = F.pad(
-            rand_ini.unsqueeze(1),           # [B, 1, D]
-            (0, 0, 0, f0_values.shape[1] - 1)  # pad dim1: 0 left, L-1 right
-        )  # [B, L, D]
-        rad_values = rad_values + offset
 
         if not self.flag_for_pulse:
             K = int(self.upsample_scale)
 
-            # Downscale to frame rate
-            rad_t = rad_values.transpose(1, 2)                         # [B, D, L]
-            rad_down_t = F.avg_pool1d(rad_t, kernel_size=K, stride=K)  # [B, D, N]
-            rad_down = rad_down_t.transpose(1, 2)                      # [B, N, D]
-
-            # Cumulative phase at frame rate
-            phase_down = torch.cumsum(rad_down, dim=1)  # [B, N, D]
-
-            # Scale by 2πK and upscale with integer scale factor
-            phase_scaled = phase_down.transpose(1, 2) * (2.0 * torch.pi * K)
-            phase_up = F.interpolate(
-                phase_scaled,
-                scale_factor=float(K),
-                mode='linear',
-                align_corners=True
-            )  # [B, D, N*K]
-            phase = phase_up.transpose(1, 2)  # [B, N*K, D]
+            # Work in [B, D, L] channels-first format to minimize transposes
+            x = rad_values.transpose(1, 2)                       # [B, D, L]
+            x = F.avg_pool1d(x, kernel_size=K, stride=K)         # [B, D, N]
+            x = torch.cumsum(x, dim=2)                           # [B, D, N]
+            x = x * (2.0 * torch.pi * K)
+            x = F.interpolate(x, scale_factor=float(K),
+                              mode='linear', align_corners=True)  # [B, D, N*K]
+            phase = x.transpose(1, 2)                             # [B, N*K, D]
 
             # Wrap phase to [0, 2π)
             two_pi = 2.0 * torch.pi
@@ -96,16 +52,6 @@ class SineGen(nn.Module):
             sines = torch.sin(phase)
 
         return sines
-
-    def forward(self, f0):
-        f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
-        fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
-        sine_waves = self._f02sine(fn) * self.sine_amp
-        uv = self._f02uv(f0)
-        noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-        noise = noise_amp * torch.randn_like(sine_waves)
-        sine_waves = sine_waves * uv + noise
-        return sine_waves, uv, noise
 
 # CustomSTFT inlined from kokoro.custom_stft.
 
@@ -127,8 +73,7 @@ class CustomSTFT(nn.Module):
             window_tensor = F.pad(window_tensor, (0, self.n_fft - self.win_length))
         elif self.win_length > self.n_fft:
             window_tensor = window_tensor[:self.n_fft]
-        self.register_buffer("window", window_tensor)
-
+        # window_tensor used only during __init__ to construct DFT matrices
         n = np.arange(self.n_fft)
         k = np.arange(self.freq_bins)
         angle = 2 * np.pi * np.outer(k, n) / self.n_fft
@@ -139,10 +84,12 @@ class CustomSTFT(nn.Module):
         forward_real = dft_real * forward_window
         forward_imag = dft_imag * forward_window
 
-        self.register_buffer("weight_forward_real",
-                             torch.from_numpy(forward_real).float().unsqueeze(1))
-        self.register_buffer("weight_forward_imag",
-                             torch.from_numpy(forward_imag).float().unsqueeze(1))
+        # Fused forward weight: cat([W_real, W_imag]) — single conv1d for both
+        self.register_buffer("weight_forward_fused",
+                             torch.cat([
+                                 torch.from_numpy(forward_real).float().unsqueeze(1),
+                                 torch.from_numpy(forward_imag).float().unsqueeze(1),
+                             ], dim=0))
 
         inv_scale = 1.0 / self.n_fft
         angle_t = 2 * np.pi * np.outer(n, k) / self.n_fft
@@ -150,21 +97,24 @@ class CustomSTFT(nn.Module):
         idft_sin = np.sin(angle_t).T
         inv_window = window_tensor.numpy() * inv_scale
 
-        self.register_buffer("weight_backward_real",
-                             torch.from_numpy(idft_cos * inv_window).float().unsqueeze(1))
-        self.register_buffer("weight_backward_imag",
-                             torch.from_numpy(idft_sin * inv_window).float().unsqueeze(1))
+        # Fused inverse weight: cat([W_real, -W_imag]) — single conv_transpose1d
+        self.register_buffer("weight_backward_fused",
+                             torch.cat([
+                                 torch.from_numpy(idft_cos * inv_window).float().unsqueeze(1),
+                                 -torch.from_numpy(idft_sin * inv_window).float().unsqueeze(1),
+                             ], dim=0))
 
     def transform(self, waveform):
         if self.center:
             pad_len = self.n_fft // 2
             waveform = F.pad(waveform, (pad_len, pad_len), mode=self.pad_mode)
         x = waveform.unsqueeze(1)
-        real_out = F.conv1d(x, self.weight_forward_real, bias=None,
-                            stride=self.hop_length, padding=0)
-        imag_out = F.conv1d(x, self.weight_forward_imag, bias=None,
-                            stride=self.hop_length, padding=0)
-        magnitude = torch.sqrt(real_out**2 + imag_out**2 + 1e-14)
+        # Single fused conv1d for both real and imag
+        ri = F.conv1d(x, self.weight_forward_fused, bias=None,
+                      stride=self.hop_length, padding=0)
+        real_out = ri[:, :self.freq_bins, :]
+        imag_out = ri[:, self.freq_bins:, :]
+        magnitude = torch.sqrt(real_out * real_out + imag_out * imag_out + 1e-14)
         phase = torch.atan2(imag_out, real_out)
         correction_mask = (imag_out == 0) & (real_out < 0)
         phase[correction_mask] = torch.pi
@@ -173,11 +123,9 @@ class CustomSTFT(nn.Module):
     def inverse(self, magnitude, phase, length=None):
         real_part = magnitude * torch.cos(phase)
         imag_part = magnitude * torch.sin(phase)
-        real_rec = F.conv_transpose1d(real_part, self.weight_backward_real,
+        combined = torch.cat([real_part, imag_part], dim=1)
+        waveform = F.conv_transpose1d(combined, self.weight_backward_fused,
                                       bias=None, stride=self.hop_length, padding=0)
-        imag_rec = F.conv_transpose1d(imag_part, self.weight_backward_imag,
-                                      bias=None, stride=self.hop_length, padding=0)
-        waveform = real_rec - imag_rec
         if self.center:
             pad_len = self.n_fft // 2
             waveform = waveform[..., pad_len:-pad_len]
@@ -303,6 +251,33 @@ def patch_pack_padded_sequence():
     nn.utils.rnn.pad_packed_sequence = lambda x, **kw: (x, None)
 
 
+def _patch_snake_mul(model):
+    """Replace pow(sin(x), 2) with sin(x) * sin(x) in Snake activations.
+
+    pow is not in ANE's native op list. Explicit mul is ANE-native
+    and avoids the pow decomposition overhead.
+    """
+    from kokoro.istftnet import AdaINResBlock1
+
+    def _snake_mul_forward(self, x, s):
+        for c1, c2, n1, n2, a1, a2 in zip(
+            self.convs1, self.convs2, self.adain1, self.adain2,
+            self.alpha1, self.alpha2
+        ):
+            xt = n1(x, s)
+            s1 = torch.sin(a1 * xt)
+            xt = xt + (1.0 / a1) * (s1 * s1)
+            xt = c1(xt)
+            xt = n2(xt, s)
+            s2 = torch.sin(a2 * xt)
+            xt = xt + (1.0 / a2) * (s2 * s2)
+            xt = c2(xt)
+            x = xt + x
+        return x
+
+    AdaINResBlock1.forward = _snake_mul_forward
+
+
 def patch_sinegen_for_export(model):
     """Apply inlined SineGen to the model and return a phases helper.
 
@@ -315,16 +290,51 @@ def patch_sinegen_for_export(model):
     # Replace _f02sine on the original class
     OriginalSineGen._f02sine = SineGen._f02sine
 
-    # Deterministic noise for reproducible comparisons
-    _orig_forward = OriginalSineGen.forward
-    def _deterministic_forward(self, f0):
-        _real_randn = torch.randn_like
-        torch.randn_like = torch.zeros_like
-        try:
-            return _orig_forward(self, f0)
-        finally:
-            torch.randn_like = _real_randn
-    OriginalSineGen.forward = _deterministic_forward
+    # Skip dead noise computation entirely.
+    # The original forward computes noise = noise_amp * randn_like(sines) then
+    # sines = sines * uv + noise. With zero noise, this simplifies to sines * uv.
+    # Eliminating the dead code produces a cleaner, smaller traced graph.
+    def _zero_noise_forward(self, f0):
+        fn = torch.multiply(f0, torch.FloatTensor(
+            [[range(1, self.harmonic_num + 2)]]).to(f0.device))
+        sine_waves = self._f02sine(fn) * self.sine_amp
+        uv = self._f02uv(f0)
+        sine_waves = sine_waves * uv
+        return sine_waves, uv, torch.zeros_like(sine_waves)
+    OriginalSineGen.forward = _zero_noise_forward
+
+    # Replace pow(sin,2) with mul in Snake activations
+    _patch_snake_mul(model)
+
+    # Round InstanceNorm output to float16 in AdaIN — InstanceNorm's
+    # reduction ops (mean, var) diverge most between float32 and float16
+    from kokoro.istftnet import AdaIN1d
+    _orig_adain_forward = AdaIN1d.forward
+    def _fp16_norm_forward(self, x, s):
+        h = self.fc(s)
+        h = h.view(h.size(0), h.size(1), 1)
+        gamma, beta = torch.chunk(h, chunks=2, dim=1)
+        return (1 + gamma) * self.norm(x).half().float() + beta
+    AdaIN1d.forward = _fp16_norm_forward
+
+    # Eliminate dead noise in SourceModuleHnNSF — noi_source is never used
+    # in the generator, and randn_like in the trace creates unnecessary ops
+    from kokoro.istftnet import SourceModuleHnNSF
+    def _no_noise_source_forward(self, x):
+        with torch.no_grad():
+            sine_wavs, uv, _ = self.l_sin_gen(x)
+        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+        return sine_merge, torch.zeros_like(uv), uv
+    SourceModuleHnNSF.forward = _no_noise_source_forward
+
+    # Pre-round weights AND buffers to float16 precision — ANE uses float16
+    # internally, so rounding makes PyTorch reference match ANE's actual computation
+    with torch.no_grad():
+        for p in model.parameters():
+            p.data = p.data.half().float()
+        for b in model.buffers():
+            if b.is_floating_point():
+                b.data = b.data.half().float()
 
     # Set external phases on all SineGen instances
     def set_phases(module, phases):
