@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "KokoroTTS",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
         .library(name: "KokoroTTS", targets: ["KokoroTTS"]),
         .executable(name: "kokoro-say", targets: ["CLI"]),
