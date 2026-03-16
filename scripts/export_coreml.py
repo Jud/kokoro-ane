@@ -356,16 +356,18 @@ def patch_sinegen_for_export(model):
     # Replace _f02sine on the original class
     OriginalSineGen._f02sine = SineGen._f02sine
 
-    # Deterministic noise for reproducible comparisons
-    _orig_forward = OriginalSineGen.forward
-    def _deterministic_forward(self, f0):
-        _real_randn = torch.randn_like
-        torch.randn_like = torch.zeros_like
-        try:
-            return _orig_forward(self, f0)
-        finally:
-            torch.randn_like = _real_randn
-    OriginalSineGen.forward = _deterministic_forward
+    # Skip dead noise computation entirely.
+    # The original forward computes noise = noise_amp * randn_like(sines) then
+    # sines = sines * uv + noise. With zero noise, this simplifies to sines * uv.
+    # Eliminating the dead code produces a cleaner, smaller traced graph.
+    def _zero_noise_forward(self, f0):
+        fn = torch.multiply(f0, torch.FloatTensor(
+            [[range(1, self.harmonic_num + 2)]]).to(f0.device))
+        sine_waves = self._f02sine(fn) * self.sine_amp
+        uv = self._f02uv(f0)
+        sine_waves = sine_waves * uv
+        return sine_waves, uv, torch.zeros_like(sine_waves)
+    OriginalSineGen.forward = _zero_noise_forward
 
     # Replace pow(sin,2) with mul in Snake activations
     _patch_snake_mul(model)
