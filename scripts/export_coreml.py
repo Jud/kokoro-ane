@@ -370,6 +370,17 @@ def patch_sinegen_for_export(model):
     # Replace pow(sin,2) with mul in Snake activations
     _patch_snake_mul(model)
 
+    # Round InstanceNorm output to float16 in AdaIN — InstanceNorm's
+    # reduction ops (mean, var) diverge most between float32 and float16
+    from kokoro.istftnet import AdaIN1d
+    _orig_adain_forward = AdaIN1d.forward
+    def _fp16_norm_forward(self, x, s):
+        h = self.fc(s)
+        h = h.view(h.size(0), h.size(1), 1)
+        gamma, beta = torch.chunk(h, chunks=2, dim=1)
+        return (1 + gamma) * self.norm(x).half().float() + beta
+    AdaIN1d.forward = _fp16_norm_forward
+
     # Pre-round weights AND buffers to float16 precision — ANE uses float16
     # internally, so rounding makes PyTorch reference match ANE's actual computation
     with torch.no_grad():
