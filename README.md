@@ -2,7 +2,7 @@
 
 text-to-speech in Swift. give it text, get 24kHz audio back.
 
-Kokoro-82M running on the Apple Neural Engine via CoreML. ~3.5x real-time on M-series. automatic chunking, voice style embeddings, speed control.
+Kokoro-82M on the Apple Neural Engine via CoreML. 6-16x real-time on M-series depending on input length. handles any length text -- automatic chunking, streaming, voice selection, speed control.
 
 ## install
 
@@ -13,13 +13,15 @@ dependencies: [
 ]
 ```
 
-models (~640MB) are downloaded automatically on first use. you can also grab them manually:
+models (~640MB) download automatically on first use. or grab them manually:
 
 ```bash
 ./scripts/download-models.sh
 ```
 
 ## usage
+
+basic synthesis -- give it text, get samples back:
 
 ```swift
 import KokoroTTS
@@ -33,7 +35,26 @@ let result = try engine.synthesize(text: "hello world", voice: "af_heart")
 // result.realTimeFactor → how much faster than real-time
 ```
 
-speed control:
+### streaming
+
+for long text, `speak()` streams audio as it's synthesized. each buffer is playback-ready -- consumers just schedule and go:
+
+```swift
+let audioEngine = AVAudioEngine()
+let player = AVAudioPlayerNode()
+audioEngine.attach(player)
+audioEngine.connect(player, to: audioEngine.mainMixerNode, format: KokoroEngine.audioFormat)
+try audioEngine.start()
+player.play()
+
+for await buffer in try engine.speak("any length text...", voice: "af_heart") {
+    player.scheduleBuffer(buffer)
+}
+```
+
+no manual chunking. no PCM conversion. text goes in, playback-ready `AVAudioPCMBuffer` comes out.
+
+### speed control
 
 ```swift
 let slow = try engine.synthesize(text: "take your time", voice: "af_heart", speed: 0.7)
@@ -42,56 +63,59 @@ let fast = try engine.synthesize(text: "let's go", voice: "af_heart", speed: 1.5
 
 ## CLI
 
-install:
-
 ```bash
 make install
 ```
-
-usage:
 
 ```bash
 kokoro-say "hello from the terminal"
 kokoro-say -v am_adam -s 1.2 "speed it up"
 kokoro-say -o output.wav "save to file"
-echo "piped input" | kokoro-say
+kokoro-say --stream "start hearing audio before synthesis finishes"
+echo "long article" | kokoro-say --stream
 kokoro-say --list-voices
 ```
 
-models are downloaded automatically on first run. use `--model-dir <path>` to override the default location.
+`--stream` starts playback as soon as the first chunk is ready. reports time-to-first-audio and per-chunk stats.
 
-run `kokoro-say --help` for all options.
+models download on first run. `--model-dir <path>` to override.
 
 ## how it works
 
 ```mermaid
 graph LR
-    A[input text] --> B[english G2P]
-    B --> C[IPA phonemes]
+    A[text] --> B[G2P]
+    B --> C[phonemes]
     C --> D[tokenizer]
     D --> E[token IDs]
-    E --> F[CoreML model<br/>StyleTTS2 + iSTFTNet]
+    E --> F[CoreML<br/>StyleTTS2 + iSTFTNet]
     G[voice embedding] --> F
-    F --> H[24kHz PCM audio]
+    F --> H[24kHz audio]
 ```
 
-text goes through a rule-based english G2P pipeline -- lexicon lookup, letter-to-sound rules, number expansion. words not in the lexicon fall back to a [BART neural G2P](https://github.com/Jud/swift-bart-g2p) model. phonemes get tokenized and fed to the CoreML model alongside a voice style embedding.
+text goes through an english G2P pipeline -- lexicon lookup, morphological stemming, number expansion. unknown words hit a fallback chain:
 
-the engine picks the smallest model bucket that fits your input:
+1. **CamelCase splitting** -- "AVAudioPlayer" → "AV" + "Audio" + "Player", each part resolved independently
+2. **BART neural G2P** -- per-part, so "AVKubernetesPlayer" → AV(spelled) + Kubernetes(BART) + Player(lexicon)
+3. **letter spelling** -- last resort for acronyms
+
+phonemes get tokenized and fed to the CoreML model with a voice style embedding.
+
+the engine picks the smallest model bucket that fits:
 
 | bucket | max tokens | audio length |
 |--------|-----------|-------------|
 | small  | 124       | ~5s         |
 | medium | 242       | ~10s        |
 
-longer text gets automatically chunked at sentence boundaries and stitched together with crossfades.
+longer text gets chunked at sentence boundaries, merged where possible, and stitched with silence gaps. `synthesize()` returns the full result. `speak()` streams chunks as `AVAudioPCMBuffer` via `AsyncStream`.
 
 ## architecture
 
 ```mermaid
 graph TD
     subgraph "text pipeline"
-        T1[raw text] --> T2[paragraph split]
+        T1[text] --> T2[paragraph split]
         T2 --> T3[G2P phonemization]
         T3 --> T4[punctuation-aware chunking]
         T4 --> T5[tokenization + merging]
@@ -100,25 +124,24 @@ graph TD
     subgraph "inference"
         T5 --> I1[bucket selection]
         I1 --> I2[CoreML prediction<br/>Neural Engine]
-        V[voice store<br/>length-indexed embeddings] --> I2
-        I2 --> I3[raw PCM samples]
+        V[voice store] --> I2
+        I2 --> I3[PCM samples]
     end
 
-    subgraph "post-processing"
-        I3 --> P1[fade in/out]
-        P1 --> P2[80Hz high-pass]
-        P2 --> P3[2.5kHz presence boost]
-        P3 --> P4[peak normalize]
+    subgraph "output"
+        I3 --> P1[fades + post-processing]
+        P1 -->|synthesize| O1[full audio array]
+        P1 -->|speak| O2[AsyncStream&lt;AVAudioPCMBuffer&gt;]
     end
 ```
 
 ## model
 
-- **architecture**: Kokoro-82M (StyleTTS2 encoder + iSTFTNet vocoder, unified)
+- **architecture**: Kokoro-82M -- StyleTTS2 encoder + iSTFTNet vocoder, unified end-to-end
 - **sample rate**: 24kHz mono
 - **voices**: style embedding vectors, one JSON per voice preset
-- **runtime**: CoreML on Apple Neural Engine (ANE), falls back to GPU/CPU
-- **platform**: macOS 15+
+- **runtime**: CoreML on Apple Neural Engine, falls back to GPU/CPU
+- **platform**: macOS 15+, iOS 18+
 
 ## license
 
