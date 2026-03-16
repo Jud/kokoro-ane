@@ -126,7 +126,7 @@ final class Lexicon {
 
     func transcribe(_ token: MToken, ctx: TokenContext) -> (String?, Int?) {
         var word = token.text
-        if let alias = token.`_`.alias { word = alias }
+        if let alias = token.meta.alias { word = alias }
         word =
             word.replacingOccurrences(of: String(UnicodeScalar(8216)!), with: "'")
             .replacingOccurrences(of: String(UnicodeScalar(8217)!), with: "'")
@@ -141,14 +141,14 @@ final class Lexicon {
         if let phoneme = res.phoneme {
             return (
                 Lexicon.applyStress(
-                    appendCurrency(phoneme, currency: token.`_`.currency), stress: token.`_`.stress),
+                    appendCurrency(phoneme, currency: token.meta.currency), stress: token.meta.stress),
                 res.rating
             )
-        } else if isNumber(word: word, is_head: token.`_`.is_head) {
+        } else if isNumber(word: word, is_head: token.meta.is_head) {
             let num = getNumber(
-                word, currency: token.`_`.currency, is_head: token.`_`.is_head,
-                num_flags: token.`_`.num_flags)
-            return (Lexicon.applyStress(num.0, stress: token.`_`.stress), num.1)
+                word, currency: token.meta.currency, is_head: token.meta.is_head,
+                num_flags: token.meta.num_flags)
+            return (Lexicon.applyStress(num.0, stress: token.meta.stress), num.1)
         } else if !word.unicodeScalars.allSatisfy({
             Lexicon.lexiconOrdinals.contains(Int($0.value))
         }) {

@@ -497,7 +497,7 @@ public final class KokoroEngine: @unchecked Sendable {
     /// audioEngine.connect(playerNode, to: audioEngine.mainMixerNode,
     ///                     format: KokoroEngine.audioFormat)
     /// ```
-    public static let audioFormat = AVAudioFormat(
+    nonisolated(unsafe) public static let audioFormat = AVAudioFormat(
         standardFormatWithSampleRate: Double(sampleRate), channels: 1)!
 
     /// Stream synthesized audio as playback-ready buffers.

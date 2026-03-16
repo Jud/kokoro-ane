@@ -125,15 +125,15 @@ final class EnglishG2P {
                     EnglishG2P.nonQuotePunctuations.contains(last)
                 {
                     tokens[i].phonemes = tokens[i].text
-                    tokens[i].`_`.rating = 3
+                    tokens[i].meta.rating = 3
                 } else if tokens[i].text.allSatisfy({
                     EnglishG2P.subTokenJunks.contains($0)
                 }) {
                     tokens[i].phonemes = nil
-                    tokens[i].`_`.rating = 3
+                    tokens[i].meta.rating = 3
                 }
             } else if i > 0 {
-                tokens[i].`_`.prespace = prespace
+                tokens[i].meta.prespace = prespace
             }
         }
 
@@ -261,16 +261,16 @@ final class EnglishG2P {
                 {
                     switch feature.value {
                     case .int(let int):
-                        token.`_`.stress = Double(int)
+                        token.meta.stress = Double(int)
                     case .double(let double):
-                        token.`_`.stress = double
+                        token.meta.stress = double
                     case .string(let string):
                         if string.hasPrefix("/") {
-                            token.`_`.is_head = true
+                            token.meta.is_head = true
                             token.phonemes = String(string.dropFirst())
-                            token.`_`.rating = 5
+                            token.meta.rating = 5
                         } else if string.hasPrefix("#") {
-                            token.`_`.num_flags = String(string.dropFirst())
+                            token.meta.num_flags = String(string.dropFirst())
                         }
                     }
                 }
@@ -281,15 +281,15 @@ final class EnglishG2P {
     }
 
     func mergeTokens(_ tokens: [MToken], unk: String? = nil) -> MToken {
-        let stressSet = Set(tokens.compactMap { $0._.stress })
-        let currencySet = Set(tokens.compactMap { $0._.currency })
-        let ratings: Set<Int?> = Set(tokens.map { $0._.rating })
+        let stressSet = Set(tokens.compactMap { $0.meta.stress })
+        let currencySet = Set(tokens.compactMap { $0.meta.currency })
+        let ratings: Set<Int?> = Set(tokens.map { $0.meta.rating })
 
         var phonemes: String? = nil
         if let unk {
             var phonemeBuilder = ""
             for token in tokens {
-                if token._.prespace,
+                if token.meta.prespace,
                     !phonemeBuilder.isEmpty,
                     !(phonemeBuilder.last?.isWhitespace ?? false),
                     token.phonemes != nil
@@ -314,7 +314,7 @@ final class EnglishG2P {
 
         let tokenRangeStart = tokens.first!.tokenRange.lowerBound
         let tokenRangeEnd = tokens.last!.tokenRange.upperBound
-        let flagChars = Set(tokens.flatMap { Array($0._.num_flags) })
+        let flagChars = Set(tokens.flatMap { Array($0.meta.num_flags) })
 
         return MToken(
             text: mergedText,
@@ -326,12 +326,12 @@ final class EnglishG2P {
             start_ts: tokens.first?.start_ts,
             end_ts: tokens.last?.end_ts,
             underscore: Underscore(
-                is_head: tokens.first?._.is_head ?? false,
+                is_head: tokens.first?.meta.is_head ?? false,
                 alias: nil,
                 stress: (stressSet.count == 1 ? stressSet.first : nil),
                 currency: currencySet.max(),
                 num_flags: String(flagChars.sorted()),
-                prespace: tokens.first?._.prespace ?? false,
+                prespace: tokens.first?.meta.prespace ?? false,
                 rating: ratings.contains(where: { $0 == nil })
                     ? nil : ratings.compactMap { $0 }.min()
             )
@@ -341,7 +341,7 @@ final class EnglishG2P {
     func foldLeft(_ tokens: [MToken]) -> [MToken] {
         var result: [MToken] = []
         for token in tokens {
-            if let last = result.last, !token.`_`.is_head {
+            if let last = result.last, !token.meta.is_head {
                 _ = result.popLast()
                 let merged = mergeTokens([last, token], unk: unk)
                 result.append(merged)
@@ -372,7 +372,7 @@ final class EnglishG2P {
         var currency: String? = nil
 
         for (i, token) in tokens.enumerated() {
-            let needsSplit = (token.`_`.alias == nil && token.phonemes == nil)
+            let needsSplit = (token.meta.alias == nil && token.phonemes == nil)
             var subtokens: [MToken] = []
             if needsSplit {
                 let parts = subtokenize(word: token.text)
@@ -380,8 +380,8 @@ final class EnglishG2P {
                     let t = MToken(copying: token)
                     t.text = part
                     t.whitespace = ""
-                    t.`_`.is_head = true
-                    t.`_`.prespace = false
+                    t.meta.is_head = true
+                    t.meta.prespace = false
                     return t
                 }
             } else {
@@ -392,17 +392,17 @@ final class EnglishG2P {
             for j in 0..<subtokens.count {
                 let token = subtokens[j]
 
-                if token.`_`.alias != nil || token.phonemes != nil {
+                if token.meta.alias != nil || token.phonemes != nil {
                     // Already resolved
                 } else if token.tag == .otherWord, Lexicon.currencies[token.text] != nil {
                     currency = token.text
                     token.phonemes = ""
-                    token.`_`.rating = 4
+                    token.meta.rating = 4
                 } else if token.tag == .dash
                     || (token.tag == .punctuation && token.text == "–")
                 {
                     token.phonemes = "—"
-                    token.`_`.rating = 3
+                    token.meta.rating = 3
                 } else if let tag = token.tag, EnglishG2P.punctuationTags.contains(tag),
                     !token.text.lowercased().unicodeScalars.allSatisfy({
                         (97...122).contains(Int($0.value))
@@ -415,14 +415,14 @@ final class EnglishG2P {
                             EnglishG2P.punctuations.contains($0)
                         }
                     }
-                    token.`_`.rating = 4
+                    token.meta.rating = 4
                 } else if currency != nil {
                     if token.tag != .number {
                         currency = nil
                     } else if j + 1 == subtokens.count
                         && (i + 1 == tokens.count || tokens[i + 1].tag != .number)
                     {
-                        token.`_`.currency = currency
+                        token.meta.currency = currency
                     }
                 } else if j > 0 && j < subtokens.count - 1 && token.text == "2" {
                     let prev = subtokens[j - 1].text
@@ -433,17 +433,17 @@ final class EnglishG2P {
                         })
                         || (prev == "-" && next == "-")
                     {
-                        token.`_`.alias = "to"
+                        token.meta.alias = "to"
                     }
                 }
 
-                if token.`_`.alias != nil || token.phonemes != nil {
+                if token.meta.alias != nil || token.phonemes != nil {
                     words.append(.single(token))
                 } else if case .compound(let last) = words.last,
                     last.last?.whitespace.isEmpty == true
                 {
                     var arr = last
-                    token.`_`.is_head = false
+                    token.meta.is_head = false
                     arr.append(token)
                     _ = words.popLast()
                     words.append(.compound(arr))
@@ -534,13 +534,13 @@ final class EnglishG2P {
                 if w.phonemes == nil {
                     let out = lexicon.transcribe(w, ctx: ctx)
                     w.phonemes = out.0
-                    w.`_`.rating = out.1
+                    w.meta.rating = out.1
                 }
 
                 if w.phonemes == nil {
                     let out = fallback(w)
                     w.phonemes = out.0
-                    w.`_`.rating = out.1
+                    w.meta.rating = out.1
                 }
 
                 ctx = tokenContext(ctx, ps: w.phonemes, token: w)
@@ -551,7 +551,7 @@ final class EnglishG2P {
                 var shouldFallback = false
                 while left < right {
                     let hasFixed = arr[left..<right].contains {
-                        $0.`_`.alias != nil || $0.phonemes != nil
+                        $0.meta.alias != nil || $0.phonemes != nil
                     }
                     let token: MToken? =
                         hasFixed ? nil : mergeTokens(Array(arr[left..<right]))
@@ -560,10 +560,10 @@ final class EnglishG2P {
 
                     if let phonemes = res.0 {
                         arr[left].phonemes = phonemes
-                        arr[left].`_`.rating = res.1
+                        arr[left].meta.rating = res.1
                         for j in (left + 1)..<right {
                             arr[j].phonemes = ""
-                            arr[j].`_`.rating = res.1
+                            arr[j].meta.rating = res.1
                         }
                         ctx = tokenContext(ctx, ps: phonemes, token: token!)
                         right = left
@@ -578,7 +578,7 @@ final class EnglishG2P {
                                 EnglishG2P.subTokenJunks.contains($0)
                             }) {
                                 last.phonemes = ""
-                                last.`_`.rating = 3
+                                last.meta.rating = 3
                             } else {
                                 shouldFallback = true
                                 break
@@ -594,12 +594,12 @@ final class EnglishG2P {
                     let first = arr[0]
                     let out = fallback(token)
                     first.phonemes = out.0
-                    first.`_`.rating = out.1
+                    first.meta.rating = out.1
                     arr[0] = first
                     if arr.count > 1 {
                         for j in 1..<arr.count {
                             arr[j].phonemes = ""
-                            arr[j].`_`.rating = out.1
+                            arr[j].meta.rating = out.1
                         }
                     }
                 } else {

@@ -61,7 +61,7 @@ class MToken {
     var phonemes: String?
     var start_ts: Double?
     var end_ts: Double?
-    var `_`: Underscore
+    var meta: Underscore
 
     init(
         text: String,
@@ -80,7 +80,7 @@ class MToken {
         self.phonemes = phonemes
         self.start_ts = start_ts
         self.end_ts = end_ts
-        self.`_` = underscore
+        self.meta = underscore
     }
 
     convenience init(copying other: MToken) {
@@ -92,7 +92,7 @@ class MToken {
             phonemes: other.phonemes,
             start_ts: other.start_ts,
             end_ts: other.end_ts,
-            underscore: Underscore(copying: other.`_`))
+            underscore: Underscore(copying: other.meta))
     }
 }
 
