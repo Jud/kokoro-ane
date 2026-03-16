@@ -967,7 +967,7 @@ def _merge_results(all_runs):
     return list(merged.values())
 
 
-MINIMUM_EXPERIMENT_SECONDS = 0  # disabled for fast iteration
+MINIMUM_EXPERIMENT_SECONDS = 300  # 5 minutes
 
 
 def _emit_results(all_runs, sentences, args):
