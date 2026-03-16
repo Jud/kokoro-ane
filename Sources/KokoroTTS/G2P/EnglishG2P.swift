@@ -475,40 +475,40 @@ final class EnglishG2P {
         return parts.isEmpty ? [word] : parts
     }
 
-    /// OOV fallback: BART neural G2P → CamelCase splitting → letter spelling.
+    /// OOV fallback: CamelCase splitting with per-part resolution.
+    ///
+    /// Each part is resolved independently: lexicon → BART → letter spelling.
+    /// "AVKubernetesPlayer" → "AV"(spell) + "Kubernetes"(BART) + "Player"(lexicon)
     private func fallback(_ word: MToken) -> (phoneme: String?, rating: Int?) {
         let text = word.text
 
-        // Layer 0: BART neural G2P (best quality for unknown words)
+        let parts = splitCamelCase(text)
+        if parts.count > 1 {
+            let fragments = parts.map { resolvePart($0) }
+            let joined = fragments.map(\.0).joined(separator: " ")
+            let minRating = fragments.map(\.1).min() ?? 1
+            return (joined, minRating)
+        }
+
+        return resolvePart(text)
+    }
+
+    /// Resolve a single word/part through the full fallback chain:
+    /// lexicon → BART → letter spelling → raw text.
+    private func resolvePart(_ text: String) -> (String, Int) {
+        if let ph = lexicon.phonemesForWord(text) {
+            return (ph, 3)
+        }
+
         if let result = bart?.predict(text.lowercased()) {
             return (result, 2)
         }
 
-        // Layer 1: CamelCase/compound splitting — each part looked up individually
-        let parts = splitCamelCase(text)
-        if parts.count > 1 {
-            var phonemeFragments: [String] = []
-            var allResolved = true
-            for part in parts {
-                if let ph = lexicon.phonemesForWord(part) {
-                    phonemeFragments.append(ph)
-                } else {
-                    allResolved = false
-                    break
-                }
-            }
-            if allResolved {
-                return (phonemeFragments.joined(separator: " "), 2)
-            }
-        }
-
-        // Layer 2: Letter spelling via getNNP (handles acronyms like API, SDK)
         let nnp = lexicon.getNNP(text)
         if let phoneme = nnp.phoneme {
             return (phoneme, nnp.rating ?? 2)
         }
 
-        // Last resort: return the text itself so downstream gets something
         return (unk, 1)
     }
 

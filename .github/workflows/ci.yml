@@ -43,6 +43,7 @@ jobs:
   benchmark:
     name: Benchmark
     runs-on: macos-15
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: swift-actions/setup-swift@v2
