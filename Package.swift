@@ -34,7 +34,8 @@ let package = Package(
         .testTarget(
             name: "KokoroTTSTests",
             dependencies: ["KokoroTTS"],
-            path: "Tests/KokoroTTSTests"
+            path: "Tests/KokoroTTSTests",
+            resources: [.process("kokoro_g2p_reference.json")]
         ),
     ]
 )

@@ -1,0 +1,91 @@
+excluded:
+  - .build
+  - Package.swift
+
+# Identifier naming — allow short names common in DSP, loops, and low-level code
+identifier_name:
+  min_length:
+    warning: 1
+    error: 1
+  max_length:
+    warning: 60
+    error: 80
+  allowed_symbols:
+    - _
+  excluded:
+    - id
+
+# Line length — match swift-format at 110, warn at 120
+line_length:
+  warning: 120
+  error: 150
+  ignores_urls: true
+  ignores_comments: true
+
+# Function body length — relaxed for ported G2P and synthesis pipeline
+function_body_length:
+  warning: 80
+  error: 150
+
+# File length — relaxed for KokoroEngine.swift which is intentionally one file
+file_length:
+  warning: 800
+  error: 1200
+
+# Type body length — relaxed for KokoroEngine
+type_body_length:
+  warning: 600
+  error: 800
+
+# Cyclomatic complexity — relaxed for ported G2P switch statements
+cyclomatic_complexity:
+  warning: 20
+  error: 60
+
+# Large tuples — allow up to 3 for (samples, durations) return types
+large_tuple:
+  warning: 5
+
+# Nesting — allow 2 levels for ArgumentParser subcommands
+nesting:
+  type_level: 2
+
+# Trailing commas — we use them
+trailing_comma:
+  mandatory_comma: true
+
+# Force try — acceptable in controlled contexts (test setup, static lets)
+force_try:
+  severity: warning
+
+# These conflict with swift-format or are too noisy
+disabled_rules:
+  - todo
+  - implicit_optional_initialization
+  - opening_brace
+  - for_where
+  - control_statement
+
+# Opt-in rules worth enabling
+closure_body_length:
+  warning: 40
+  error: 60
+
+opt_in_rules:
+  - closure_body_length
+  - contains_over_filter_count
+  - contains_over_first_not_nil
+  - empty_collection_literal
+  - empty_count
+  - empty_string
+  - fatal_error_message
+  - first_where
+  - last_where
+  - modifier_order
+  - overridden_super_call
+  - private_action
+  - private_outlet
+  - redundant_nil_coalescing
+  - sorted_first_last
+  - unowned_variable_capture
+  - yoda_condition

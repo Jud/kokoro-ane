@@ -11,11 +11,8 @@ import Testing
 struct InferenceBenchmarkTests {
     static let runs = 5
 
-    static let engine: KokoroEngine = {
-        let e = try! KokoroEngine(modelDirectory: ModelManager.defaultDirectory())
-        e.warmUp()
-        return e
-    }()
+    // swiftlint:disable:next force_try
+    static let engine = try! KokoroEngine(modelDirectory: ModelManager.defaultDirectory())
 
     @Test("Short sentence — single chunk synthesis")
     func shortSentence() throws {

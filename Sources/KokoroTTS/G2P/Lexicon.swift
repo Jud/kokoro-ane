@@ -3,7 +3,7 @@
 import Foundation
 import NaturalLanguage
 
-final class Lexicon {
+final class Lexicon {  // swiftlint:disable:this type_body_length
     static let usVocab: Set<Character> = Set("AIOWYbdfhijklmnpstuvwzæðŋɑɔəɛɜɡɪɹɾʃʊʌʒʤʧˈˌθᵊᵻʔ")
     static let gbVocab: Set<Character> = Set("AIQWYabdfhijklmnpstuvwzðŋɑɒɔəɛɜɡɪɹʃʊʌʒʤʧˈˌːθᵊ")
     static let lexiconOrdinals: [Int] = [39, 45] + Array(65...90) + Array(97...122)
@@ -213,7 +213,9 @@ final class Lexicon {
         return c
     }
 
-    private func getWord(_ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext)
+    private func getWord(
+        _ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext
+    )
         -> (phoneme: String?, rating: Int?)
     {
         let sc = getSpecialCase(word, tag: tag, stress: stress, ctx: ctx)
@@ -258,7 +260,10 @@ final class Lexicon {
         return (nil, nil)
     }
 
-    private func getSpecialCase(_ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext)
+    // swiftlint:disable:next cyclomatic_complexity
+    private func getSpecialCase(
+        _ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext
+    )
         -> (phoneme: String?, rating: Int?)
     {
         if tag == .punctuation, let target = Lexicon.addSymbols[word] {
@@ -287,7 +292,7 @@ final class Lexicon {
                 return getNNP(word)
             }
             return ("ɐn", 4)
-        } else if word == "I", let tag, isPersonalPrononun(tag: tag, token: word) {
+        } else if word == "I", let tag, isPersonalPronoun(tag: tag, token: word) {
             return (String(Lexicon.secondaryStress) + "I", 4)
         } else if ["by", "By", "BY"].contains(word),
             getParentTag(tag, token: word) == "ADV"
@@ -330,7 +335,9 @@ final class Lexicon {
         return (nil, nil)
     }
 
-    private func lookup(_ w: String, tag: NLTag?, stress: Double?, ctx: TokenContext?) -> (
+    private func lookup(
+        _ w: String, tag: NLTag?, stress: Double?, ctx: TokenContext?
+    ) -> (
         phoneme: String?, rating: Int?
     ) {
         var word = w
@@ -351,7 +358,7 @@ final class Lexicon {
             if let ctx = ctx, ctx.futureVowel == nil, phonemeDict["None"] != nil {
                 t = "XX"
             }
-            phoneticString = phonemeDict[t ?? "DEFAULT"] ?? phonemeDict["DEFAULT"] ?? nil
+            phoneticString = phonemeDict[t ?? "DEFAULT"] ?? phonemeDict["DEFAULT"]
         }
 
         if phoneticString == nil
@@ -396,7 +403,9 @@ final class Lexicon {
         return word[idx...].uppercased() == word[idx...]
     }
 
-    private func stem_s(_ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext?) -> (
+    private func stem_s(
+        _ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext?
+    ) -> (
         phoneme: String?, rating: Int?
     ) {
         guard word.count >= 3, word.hasSuffix("s") else { return (nil, nil) }
@@ -404,8 +413,8 @@ final class Lexicon {
 
         if !word.hasSuffix("ss"), isKnown(String(word.dropLast())) {
             stem = String(word.dropLast())
-        } else if (word.hasSuffix("'s")
-            || (word.count > 4 && word.hasSuffix("es") && !word.hasSuffix("ies"))),
+        } else if word.hasSuffix("'s")
+            || (word.count > 4 && word.hasSuffix("es") && !word.hasSuffix("ies")),
             isKnown(String(word.dropLast(2)))
         {
             stem = String(word.dropLast(2))
@@ -441,7 +450,9 @@ final class Lexicon {
         return stem + "ᵻd"
     }
 
-    private func stem_ed(_ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext?) -> (
+    private func stem_ed(
+        _ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext?
+    ) -> (
         phoneme: String?, rating: Int?
     ) {
         guard word.count >= 4, word.hasSuffix("d") else { return (nil, nil) }
@@ -476,7 +487,9 @@ final class Lexicon {
         return stem + "ɪŋ"
     }
 
-    private func stem_ing(_ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext?) -> (
+    private func stem_ing(
+        _ word: String, tag: NLTag?, stress: Double?, ctx: TokenContext?
+    ) -> (
         phoneme: String?, rating: Int?
     ) {
         guard word.count >= 5, word.hasSuffix("ing") else { return (nil, nil) }
@@ -542,6 +555,7 @@ final class Lexicon {
         return !string.isEmpty && string.allSatisfy { $0.isNumber }
     }
 
+    // swiftlint:disable:next cyclomatic_complexity function_body_length
     private func getNumber(
         _ input: String, currency: String?, is_head: Bool, num_flags: String
     ) -> (String?, Int?) {

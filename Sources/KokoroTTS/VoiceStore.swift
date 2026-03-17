@@ -25,7 +25,7 @@ final class VoiceStore: Sendable {
             throw KokoroError.modelsNotAvailable(directory)
         }
 
-        var loaded = [String: VoicePack]()
+        var loaded: [String: VoicePack] = [:]
 
         let files = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         for file in files where file.pathExtension == "json" {
@@ -45,11 +45,6 @@ final class VoiceStore: Sendable {
     /// nearest available length, then the generic embedding.
     func embedding(for voice: String, tokenCount: Int) throws -> [Float] {
         try pack(for: voice).embedding(forTokenCount: tokenCount)
-    }
-
-    /// Get the generic embedding (for warmup or when token count is unknown).
-    func embedding(for voice: String) throws -> [Float] {
-        try pack(for: voice).generic
     }
 
     private func pack(for voice: String) throws -> VoicePack {
@@ -82,7 +77,7 @@ final class VoiceStore: Sendable {
 
         // Load length-indexed embeddings ("1", "2", ..., "510").
         // Find max key first, then build a flat array for O(1) lookup.
-        var entries = [(Int, [Float])]()
+        var entries: [(Int, [Float])] = []
         for (key, value) in json {
             guard let idx = Int(key), let arr = value as? [Double], arr.count >= styleDim else {
                 continue

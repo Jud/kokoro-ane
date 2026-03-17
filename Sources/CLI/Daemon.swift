@@ -101,17 +101,15 @@ struct Daemon: ParsableCommand {
         }
 
         private func runForeground(pidPath: String, sockPath: String) throws {
-            let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? ModelManager.defaultDirectory()
-
-            if !ModelManager.modelsAvailable(at: dir) {
-                try ModelDownloader.download(to: dir)
-                guard ModelManager.modelsAvailable(at: dir) else {
-                    throw ExitCode.failure
-                }
-            }
-
+            let dir =
+                modelDir.map { URL(fileURLWithPath: $0) } ?? KokoroEngine.defaultModelDirectory
+            try CLIModelDownloader.ensureModels(at: dir)
             let engine = try KokoroEngine(modelDirectory: dir)
-            engine.warmUp()
+
+            // Wait for auto-warmup to complete before accepting connections
+            while !engine.isReady {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
 
             let serverFd = UnixSocket.bind(to: sockPath)
             guard serverFd >= 0 else { throw ExitCode.failure }
@@ -282,7 +280,6 @@ private func handleClient(fd: Int32, engine: KokoroEngine) {
             sampleCount: result.samples.count,
             synthesisTime: result.synthesisTime,
             phonemes: result.phonemes,
-            bucket: result.bucket?.modelName,
             tokenCount: result.tokenCount)
 
         guard let responseData = try? JSONEncoder().encode(response) else { return }

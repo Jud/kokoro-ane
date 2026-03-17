@@ -21,10 +21,10 @@ enum MLArrayHelpers {
 
     /// Fill a pre-allocated style embedding MLMultiArray from a float vector.
     ///
-    /// Zeros trailing slots beyond `styleVector.count` to prevent stale data
-    /// when reusing pre-allocated buffers.
-    static func fillStyleArray(from styleVector: [Float], into array: MLMultiArray) {
-        let dim = VoiceStore.styleDim
+    /// Copies up to `dim` elements from `styleVector` into `array`, zeroing
+    /// any trailing slots to prevent stale data in reused buffers.
+    static func fillStyleArray(from styleVector: [Float], into array: MLMultiArray, dim: Int? = nil) {
+        let dim = dim ?? VoiceStore.styleDim
         let ptr = array.dataPointer.assumingMemoryBound(to: Float.self)
         let n = min(styleVector.count, dim)
         styleVector.withUnsafeBufferPointer { src in

@@ -1,12 +1,9 @@
 import Foundation
 
 enum DaemonConfig {
-    private static var basePath: String {
-        "\(NSTemporaryDirectory())kokoro-tts-\(getuid())"
-    }
-
-    static var socketPath: String { basePath + ".sock" }
-    static var pidPath: String { basePath + ".pid" }
+    private static let basePath = "\(NSTemporaryDirectory())kokoro-tts-\(getuid())"
+    static let socketPath = basePath + ".sock"
+    static let pidPath = basePath + ".pid"
 }
 
 struct SynthesisRequest: Codable {
@@ -22,7 +19,6 @@ struct SynthesisResponse: Codable {
     var sampleCount: Int?
     var synthesisTime: Double?
     var phonemes: String?
-    var bucket: String?
     var tokenCount: Int?
 }
 

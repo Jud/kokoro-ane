@@ -27,8 +27,6 @@ basic synthesis -- give it text, get samples back:
 import KokoroTTS
 
 let engine = try KokoroEngine(modelDirectory: modelPath)
-engine.warmUp()
-
 let result = try engine.synthesize(text: "hello world", voice: "af_heart")
 // result.samples → 24kHz mono PCM float array
 // result.duration → audio length in seconds

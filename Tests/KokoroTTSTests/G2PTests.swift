@@ -1,4 +1,5 @@
 import Testing
+
 @testable import KokoroTTS
 
 @Suite("G2P")

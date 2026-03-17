@@ -1,0 +1,82 @@
+[
+  {
+    "text": "Hello world",
+    "phonemes": "həlˈO wˈɜɹld"
+  },
+  {
+    "text": "The quick brown fox jumps over the lazy dog.",
+    "phonemes": "ðə kwˈɪk bɹˈWn fˈɑks ʤˈʌmps ˈOvəɹ ðə lˈAzi dˈɔɡ."
+  },
+  {
+    "text": "I have 42 cats.",
+    "phonemes": "ˌI hæv fˈɔɹTi tˈu kˈæts."
+  },
+  {
+    "text": "She said hello to Dr. Smith.",
+    "phonemes": "ʃˌi sˈɛd həlˈO tə dˈɑktəɹ smˈɪθ."
+  },
+  {
+    "text": "The temperature is 98.6 degrees.",
+    "phonemes": "ðə tˈɛmpɹəʧəɹ ɪz nˈIndi ˈAt pYnt sˈɪks dəɡɹˈiz."
+  },
+  {
+    "text": "AVFoundation handles audio playback.",
+    "phonemes": "ˌAvˈi fWndˈAʃən hˈændəlz ˈɔdiO plˈAbˌæk."
+  },
+  {
+    "text": "Running quickly through the forest.",
+    "phonemes": "ɹˈʌnɪŋ kwˈɪkli θɹu ðə fˈɔɹəst."
+  },
+  {
+    "text": "It costs $19.99 today.",
+    "phonemes": "ˌɪt kˈɔsts nˌIntˈin dˈɑləɹz ænd nˈIndi nˈIn sˈɛnts tədˈA."
+  },
+  {
+    "text": "He can't believe it's not butter.",
+    "phonemes": "hˌi kˈænt bəlˈiv ɪts nˌɑt bˈʌTəɹ."
+  },
+  {
+    "text": "The 1st of January, 2025.",
+    "phonemes": "ðə fˈɜɹst ʌv ʤˈænjəwˌɛɹi, twˈɛnti twˈɛnti fˈIv."
+  },
+  {
+    "text": "Mr. and Mrs. Johnson arrived.",
+    "phonemes": "mˈɪstəɹ ænd mˈɪsɪz ʤˈɑnsᵊn əɹˈIvd."
+  },
+  {
+    "text": "They're going to the store.",
+    "phonemes": "ðˌɛɹ ɡˈOɪŋ tə ðə stˈɔɹ."
+  },
+  {
+    "text": "A beautiful, sunny afternoon.",
+    "phonemes": "ɐ bjˈuTəfəl, sˈʌni ˌæftəɹnˈun."
+  },
+  {
+    "text": "What time is it?",
+    "phonemes": "wˌʌt tˈIm ɪz ɪt?"
+  },
+  {
+    "text": "I don't know!",
+    "phonemes": "ˌI dˈOnt nˈO!"
+  },
+  {
+    "text": "The United States of America.",
+    "phonemes": "ðə junˈITᵻd stˈAts ʌv əmˈɛɹəkə."
+  },
+  {
+    "text": "Please turn left at the intersection.",
+    "phonemes": "plˈiz tˈɜɹn lˈɛft æt ði ˌɪntəɹsˈɛkʃən."
+  },
+  {
+    "text": "Good morning, how are you doing?",
+    "phonemes": "ɡˈʊd mˈɔɹnɪŋ, hˌW ɑɹ ju dˈuɪŋ?"
+  },
+  {
+    "text": "Three hundred and forty two.",
+    "phonemes": "θɹˈi hˈʌndɹəd ænd fˈɔɹTi tˈu."
+  },
+  {
+    "text": "The children played outside.",
+    "phonemes": "ðə ʧˈɪldɹᵊn plˈAd ˌWtsˈId."
+  }
+]

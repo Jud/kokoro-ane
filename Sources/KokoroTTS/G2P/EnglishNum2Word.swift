@@ -57,7 +57,7 @@ struct EnglishNum2Word {
 
         if lNum == 1 && rNum < 100 {
             return (rText, rNum)
-        } else if 100 > lNum && lNum > rNum {
+        } else if lNum < 100 && lNum > rNum {
             return ("\(lText)-\(rText)", lNum + rNum)
         } else if lNum >= 100 && rNum < 100 {
             return ("\(lText) and \(rText)", lNum + rNum)

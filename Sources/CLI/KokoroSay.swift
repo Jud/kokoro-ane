@@ -1,9 +1,7 @@
-import ArgumentParser
 import AVFoundation
+import ArgumentParser
 import Foundation
 import KokoroTTS
-
-extension ModelBucket: ExpressibleByArgument {}
 
 @main
 struct Kokoro: AsyncParsableCommand {
@@ -35,9 +33,6 @@ struct Say: AsyncParsableCommand {
     @Option(name: .long, help: "Model directory path")
     var modelDir: String?
 
-    @Option(name: .long, help: "Force model bucket")
-    var bucket: ModelBucket?
-
     @Flag(name: [.short, .long], help: "Play audio through speakers")
     var play = false
 
@@ -57,10 +52,8 @@ struct Say: AsyncParsableCommand {
     var text: [String] = []
 
     func validate() throws {
-        guard KokoroEngine.speedRange.contains(speed) else {
-            throw ValidationError(
-                "Speed must be between \(KokoroEngine.speedRange.lowerBound) and \(KokoroEngine.speedRange.upperBound)"
-            )
+        guard (0.5...2.0).contains(speed) else {
+            throw ValidationError("Speed must be between 0.5 and 2.0")
         }
     }
 
@@ -105,15 +98,14 @@ struct Say: AsyncParsableCommand {
                 text: inputText, voice: voice, speed: speed, raw: raw)
             switch DaemonClient.synthesize(request) {
             case .success(let response, let samples):
-                let duration = Double(samples.count) / Double(KokoroEngine.sampleRate)
+                let duration = Double(samples.count) / KokoroEngine.audioFormat.sampleRate
                 let synthMs = (response.synthesisTime ?? 0) * 1000
                 let rt =
                     (response.synthesisTime ?? 0) > 0
                     ? duration / response.synthesisTime! : 0
-                let tag = response.bucket.map { " \($0)" } ?? ""
                 let stats = String(
                     format: "%.0fms synth, %.1fs audio, %.1fx RT", synthMs, duration, rt)
-                print("[\(voice)\(tag) daemon] \(stats)")
+                print("[\(voice) daemon] \(stats)")
                 if let output {
                     try writeWAV(samples: samples, to: output)
                     print("Wrote \(output)")
@@ -140,24 +132,22 @@ struct Say: AsyncParsableCommand {
         }
 
         if debug {
-            let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? ModelManager.defaultDirectory()
+            let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? KokoroEngine.defaultModelDirectory
             print("Model dir: \(dir.path)")
-            print("Loaded buckets: \(engine.activeBuckets.map(\.modelName).joined(separator: ", "))")
         }
 
         let result = try engine.synthesize(
             text: inputText, voice: voice, speed: speed,
-            bucket: bucket, rawAudio: raw
+            rawAudio: raw
         )
 
         if debug { printDebugInfo(result: result) }
 
-        let tag = result.bucket.map { " \($0.modelName)" } ?? ""
         let stats = String(
             format: "%.0fms synth, %.1fs audio, %.1fx RT",
             result.synthesisTime * 1000, result.duration, result.realTimeFactor
         )
-        print("[\(voice)\(tag)] \(stats)")
+        print("[\(voice)] \(stats)")
         if let output {
             try writeWAV(samples: result.samples, to: output)
             print("Wrote \(output)")
@@ -173,18 +163,8 @@ struct Say: AsyncParsableCommand {
     }
 
     private func loadEngine() throws -> KokoroEngine {
-        let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? ModelManager.defaultDirectory()
-
-        if !ModelManager.modelsAvailable(at: dir) {
-            try ModelDownloader.download(to: dir)
-            guard ModelManager.modelsAvailable(at: dir) else {
-                fputs("Download completed but models could not be loaded.\n", stderr)
-                throw ExitCode.failure
-            }
-        } else {
-            ModelDownloader.checkForUpdates(at: dir)
-        }
-
+        let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? KokoroEngine.defaultModelDirectory
+        try CLIModelDownloader.ensureModels(at: dir)
         return try KokoroEngine(modelDirectory: dir)
     }
 
@@ -239,7 +219,7 @@ struct Say: AsyncParsableCommand {
         let url = URL(fileURLWithPath: path)
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatLinearPCM),
-            AVSampleRateKey: Double(KokoroEngine.sampleRate),
+            AVSampleRateKey: KokoroEngine.audioFormat.sampleRate,
             AVNumberOfChannelsKey: 1,
             AVLinearPCMBitDepthKey: 16,
             AVLinearPCMIsFloatKey: false,
@@ -291,11 +271,11 @@ struct Say: AsyncParsableCommand {
             }
         }
 
-        let duration = Double(totalFrames) / Double(KokoroEngine.sampleRate)
+        let duration = Double(totalFrames) / KokoroEngine.audioFormat.sampleRate
         let elapsed = CFAbsoluteTimeGetCurrent() - t0
-        print(
-            "[\(voice)] \(chunks) chunks, \(String(format: "%.1f", duration))s audio, \(Int(elapsed * 1000))ms total synth"
-        )
+        let synthMs = Int(elapsed * 1000)
+        let durStr = String(format: "%.1f", duration)
+        print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
 
         let sentinel = AVAudioPCMBuffer(pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)!
         sentinel.frameLength = 1
@@ -308,9 +288,6 @@ struct Say: AsyncParsableCommand {
 
     private func printDebugInfo(result: SynthesisResult) {
         print("Phonemes: \(result.phonemes)")
-        if let bucket = result.bucket {
-            print("Selected bucket: \(bucket.modelName) (\(bucket.maxTokens) max tokens)")
-        }
         let windowSize = 120
         let windows = min(20, result.samples.count / windowSize)
         print("\nOnset amplitude profile (first \(windows * 5)ms):")
@@ -326,26 +303,6 @@ struct Say: AsyncParsableCommand {
         for s in result.samples { globalPeak = max(globalPeak, abs(s)) }
         print(String(format: "\n  Global peak: %.3f", globalPeak))
         print(String(format: "  Total samples: %d (%.1fs)", result.samples.count, result.duration))
-        print(
-            String(
-                format: "  Token durations (%d): %@", result.tokenDurations.count,
-                result.tokenDurations.map(String.init).joined(separator: ", ")))
-
-        let hopSize = KokoroEngine.hopSize
-        var cumFrames = 0
-        for (i, dur) in result.tokenDurations.enumerated() {
-            let startSample = cumFrames * hopSize
-            let endSample = min((cumFrames + dur) * hopSize, result.samples.count)
-            var peak: Float = 0
-            if startSample < endSample {
-                for j in startSample..<endSample { peak = max(peak, abs(result.samples[j])) }
-            }
-            print(
-                String(
-                    format: "    t%02d: dur=%2d  %6d-%6d  peak=%.3f",
-                    i, dur, startSample, endSample, peak))
-            cumFrames += dur
-        }
     }
 }
 
@@ -360,13 +317,9 @@ struct Update: AsyncParsableCommand {
     var modelDir: String?
 
     mutating func run() async throws {
-        let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? ModelManager.defaultDirectory()
-        if ModelDownloader.isUpToDate(at: dir) {
-            print("models are up to date.")
-            return
-        }
-        try ModelDownloader.download(to: dir)
-        guard ModelManager.modelsAvailable(at: dir) else {
+        let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? KokoroEngine.defaultModelDirectory
+        try CLIModelDownloader.downloadWithProgress(to: dir)
+        guard KokoroEngine.isDownloaded(at: dir) else {
             fputs("Download completed but models could not be loaded.\n", stderr)
             throw ExitCode.failure
         }

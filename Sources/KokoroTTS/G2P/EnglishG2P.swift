@@ -34,18 +34,17 @@ final class EnglishG2P {
     static let primaryStress = stresses[stresses.index(stresses.startIndex, offsetBy: 1)]
     static let secondaryStress = stresses[stresses.index(stresses.startIndex, offsetBy: 0)]
     static let subtokenizeRegexPattern =
+        // swiftlint:disable:next line_length
         #"^[''']+|\p{Lu}(?=\p{Lu}\p{Ll})|(?:^-)?(?:\d?[,.]?\d)+|[-_]+|[''']{2,}|\p{L}*?(?:[''']\p{L})*?\p{Ll}(?=\p{Lu})|\p{L}+(?:[''']\p{L})*|[^-_\p{L}'''\d]|[''']+$"#
+    // swiftlint:disable force_try
     static let subtokenizeRegex = try! NSRegularExpression(
         pattern: EnglishG2P.subtokenizeRegexPattern, options: [])
-
     /// Regex for splitting CamelCase and compound words into sub-parts.
-    /// Handles: AVFoundation → [AV, Foundation], viewDidLoad → [view, Did, Load],
-    /// localhost → [local, host], UIViewController → [UI, View, Controller]
     private static let camelSplitRegex = try! NSRegularExpression(
         pattern: #"[A-Z]{2,}(?=[A-Z][a-z])|[A-Z]{2,}$|[A-Z][a-z]*|[a-z]+"#, options: [])
-
     private static let linkRegex = try! NSRegularExpression(
         pattern: #"\[([^\]]+)\]\(([^\)]*)\)"#, options: [])
+    // swiftlint:enable force_try
 
     private static let dipthongs: Set<Character> = Set("AIOQWYʤʧ")
 
@@ -367,6 +366,7 @@ final class EnglishG2P {
         case compound([MToken])
     }
 
+    // swiftlint:disable:next function_body_length
     func retokenize(_ tokens: [MToken]) -> [RetokenizedItem] {
         var words: [RetokenizedItem] = []
         var currency: String? = nil
@@ -514,6 +514,7 @@ final class EnglishG2P {
 
     // MARK: - Main Pipeline
 
+    // swiftlint:disable:next function_body_length
     func phonemize(text: String, performPreprocess: Bool = true) -> (String, [MToken]) {
         let pre: PreprocessTuple
         if performPreprocess {

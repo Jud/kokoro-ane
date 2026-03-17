@@ -7,9 +7,21 @@
     "respectsExistingLineBreaks": true,
     "lineBreakBeforeControlFlowKeywords": false,
     "lineBreakBeforeEachArgument": false,
+    "lineBreakAroundMultilineExpressionChainComponents": false,
     "indentConditionalCompilationBlocks": true,
     "maximumBlankLines": 1,
+    "prioritizeKeepingFunctionOutputTogether": true,
     "rules": {
-        "AlwaysUseLowerCamelCase": false
+        "AlwaysUseLowerCamelCase": false,
+        "AlwaysUseLiteralForEmptyCollectionInit": true,
+        "NeverForceUnwrap": false,
+        "NeverUseForceTry": false,
+        "NeverUseImplicitlyUnwrappedOptionals": false,
+        "NoAccessLevelOnExtensionDeclaration": true,
+        "OrderedImports": true,
+        "ReturnVoidInsteadOfEmptyTuple": true,
+        "UseLetInEveryBoundCaseVariable": false,
+        "UseShorthandTypeNames": true,
+        "UseWhereClausesInForLoops": false
     }
 }
