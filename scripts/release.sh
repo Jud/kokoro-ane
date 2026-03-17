@@ -56,8 +56,10 @@ echo ""
 echo "Step 4: Packaging..."
 cd "$EXPORT_DIR"
 tar czf "../$TARBALL" \
-    kokoro_21_5s.mlmodelc \
-    kokoro_24_10s.mlmodelc \
+    kokoro_21_5s_frontend.mlmodelc \
+    kokoro_21_5s_backend.mlmodelc \
+    kokoro_24_10s_frontend.mlmodelc \
+    kokoro_24_10s_backend.mlmodelc \
     voices
 cd ..
 

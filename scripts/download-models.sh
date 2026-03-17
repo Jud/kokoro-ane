@@ -14,8 +14,8 @@ fi
 # Find latest models-* release
 TAG=$(gh api "repos/$REPO/releases" --jq '[.[] | select(.tag_name | startswith("models-"))][0].tag_name' 2>/dev/null || echo "")
 if [ -z "$TAG" ]; then
-    echo "Could not fetch latest release tag, falling back to models-v1"
-    TAG="models-v1"
+    echo "Error: Could not fetch latest release tag. Check network and gh auth."
+    exit 1
 fi
 
 URL="https://github.com/$REPO/releases/download/$TAG/$ASSET"
