@@ -11,7 +11,7 @@ struct Kokoro: AsyncParsableCommand {
         commandName: "kokoro",
         abstract: "Kokoro text-to-speech",
         version: "0.3.0",
-        subcommands: [Say.self, Update.self],
+        subcommands: [Say.self, Update.self, Daemon.self],
         defaultSubcommand: Say.self
     )
 }
@@ -89,26 +89,49 @@ struct Say: AsyncParsableCommand {
     }
 
     private func execute() throws {
-        let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? ModelManager.defaultDirectory()
-
-        if !ModelManager.modelsAvailable(at: dir) {
-            try ModelDownloader.download(to: dir)
-            guard ModelManager.modelsAvailable(at: dir) else {
-                fputs("Download completed but models could not be loaded.\n", stderr)
-                throw ExitCode.failure
-            }
-        } else {
-            ModelDownloader.checkForUpdates(at: dir)
-        }
-
-        let engine = try KokoroEngine(modelDirectory: dir)
-
+        // --list-voices needs the engine, handle separately
         if listVoices {
+            let engine = try loadEngine()
             for v in engine.availableVoices.sorted() { print(v) }
             return
         }
 
+        // Resolve text once for both paths
         let inputText = try resolveText()
+
+        // Try daemon (unless --debug which needs local engine info)
+        if !debug {
+            let request = SynthesisRequest(
+                text: inputText, voice: voice, speed: speed, raw: raw)
+            switch DaemonClient.synthesize(request) {
+            case .success(let response, let samples):
+                let duration = Double(samples.count) / Double(KokoroEngine.sampleRate)
+                let synthMs = (response.synthesisTime ?? 0) * 1000
+                let rt =
+                    (response.synthesisTime ?? 0) > 0
+                    ? duration / response.synthesisTime! : 0
+                let tag = response.bucket.map { " \($0)" } ?? ""
+                let stats = String(
+                    format: "%.0fms synth, %.1fs audio, %.1fx RT", synthMs, duration, rt)
+                print("[\(voice)\(tag) daemon] \(stats)")
+                if let output {
+                    try writeWAV(samples: samples, to: output)
+                    print("Wrote \(output)")
+                }
+                if play || output == nil {
+                    try playAudio(samples: samples)
+                }
+                return
+            case .daemonError(let message):
+                fputs("Daemon error: \(message)\n", stderr)
+                throw ExitCode.failure
+            case .unavailable:
+                break  // fall through to direct engine
+            }
+        }
+
+        // Direct engine path
+        let engine = try loadEngine()
 
         guard engine.availableVoices.contains(voice) else {
             fputs("Unknown voice '\(voice)'. Available:\n", stderr)
@@ -117,6 +140,7 @@ struct Say: AsyncParsableCommand {
         }
 
         if debug {
+            let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? ModelManager.defaultDirectory()
             print("Model dir: \(dir.path)")
             print("Loaded buckets: \(engine.activeBuckets.map(\.modelName).joined(separator: ", "))")
         }
@@ -134,18 +158,21 @@ struct Say: AsyncParsableCommand {
             result.synthesisTime * 1000, result.duration, result.realTimeFactor
         )
         print("[\(voice)\(tag)] \(stats)")
-
         if let output {
             try writeWAV(samples: result.samples, to: output)
             print("Wrote \(output)")
         }
-
         if play || (output == nil && !debug) {
             try playAudio(samples: result.samples)
         }
+
+        // Occasional daemon hint (not in --debug mode where user chose local)
+        if !debug && Int.random(in: 0..<3) == 0 {
+            fputs("Tip: run 'kokoro daemon start' for faster synthesis\n", stderr)
+        }
     }
 
-    private func executeStreaming() async throws {
+    private func loadEngine() throws -> KokoroEngine {
         let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? ModelManager.defaultDirectory()
 
         if !ModelManager.modelsAvailable(at: dir) {
@@ -154,9 +181,15 @@ struct Say: AsyncParsableCommand {
                 fputs("Download completed but models could not be loaded.\n", stderr)
                 throw ExitCode.failure
             }
+        } else {
+            ModelDownloader.checkForUpdates(at: dir)
         }
 
-        let engine = try KokoroEngine(modelDirectory: dir)
+        return try KokoroEngine(modelDirectory: dir)
+    }
+
+    private func executeStreaming() async throws {
+        let engine = try loadEngine()
         let inputText = try resolveText()
 
         guard engine.availableVoices.contains(voice) else {
