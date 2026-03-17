@@ -68,12 +68,14 @@ make install
 ```
 
 ```bash
-kokoro-say "hello from the terminal"
-kokoro-say -v am_adam -s 1.2 "speed it up"
-kokoro-say -o output.wav "save to file"
-kokoro-say --stream "start hearing audio before synthesis finishes"
-echo "long article" | kokoro-say --stream
-kokoro-say --list-voices
+kokoro say "hello from the terminal"
+kokoro say -v am_adam -s 1.2 "speed it up"
+kokoro say -o output.wav "save to file"
+kokoro say --stream "start hearing audio before synthesis finishes"
+echo "long article" | kokoro say --stream
+kokoro say --list-voices
+kokoro daemon start   # keep models loaded for fast repeat synthesis
+kokoro daemon stop
 ```
 
 `--stream` starts playback as soon as the first chunk is ready. reports time-to-first-audio and per-chunk stats.
@@ -88,9 +90,10 @@ graph LR
     B --> C[phonemes]
     C --> D[tokenizer]
     D --> E[token IDs]
-    E --> F[CoreML<br/>StyleTTS2 + iSTFTNet]
-    G[voice embedding] --> F
-    F --> H[24kHz audio]
+    E --> F1[CoreML frontend<br/>predictor + SineGen, CPU]
+    G[voice embedding] --> F1
+    F1 --> F2[CoreML backend<br/>decoder + iSTFTNet, ANE]
+    F2 --> H[24kHz audio]
 ```
 
 text goes through an english G2P pipeline -- lexicon lookup, morphological stemming, number expansion. unknown words hit a fallback chain:
@@ -99,7 +102,7 @@ text goes through an english G2P pipeline -- lexicon lookup, morphological stemm
 2. **BART neural G2P** -- per-part, so "AVKubernetesPlayer" → AV(spelled) + Kubernetes(BART) + Player(lexicon)
 3. **letter spelling** -- last resort for acronyms
 
-phonemes get tokenized and fed to the CoreML model with a voice style embedding.
+phonemes get tokenized and fed to the CoreML models with a voice style embedding.
 
 the engine picks the smallest model bucket that fits:
 
@@ -123,13 +126,14 @@ graph TD
 
     subgraph "inference"
         T5 --> I1[bucket selection]
-        I1 --> I2[CoreML prediction<br/>Neural Engine]
+        I1 --> I2[frontend: predictor + SineGen<br/>CPU]
         V[voice store] --> I2
-        I2 --> I3[PCM samples]
+        I2 --> I3[backend: decoder + iSTFTNet<br/>Neural Engine]
+        I3 --> I4[PCM samples]
     end
 
     subgraph "output"
-        I3 --> P1[fades + post-processing]
+        I4 --> P1[fades + post-processing]
         P1 -->|synthesize| O1[full audio array]
         P1 -->|speak| O2[AsyncStream&lt;AVAudioPCMBuffer&gt;]
     end
@@ -137,10 +141,10 @@ graph TD
 
 ## model
 
-- **architecture**: Kokoro-82M -- StyleTTS2 encoder + iSTFTNet vocoder, unified end-to-end
+- **architecture**: Kokoro-82M -- StyleTTS2 encoder + iSTFTNet vocoder, split frontend (CPU) + backend (ANE)
 - **sample rate**: 24kHz mono
 - **voices**: style embedding vectors, one JSON per voice preset
-- **runtime**: CoreML on Apple Neural Engine, falls back to GPU/CPU
+- **runtime**: CoreML -- frontend on CPU, backend on Apple Neural Engine
 - **platform**: macOS 15+, iOS 18+
 
 ## license

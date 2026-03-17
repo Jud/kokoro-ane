@@ -50,7 +50,7 @@ public enum ModelBucket: String, CaseIterable, Sendable, Comparable {
 /// High-quality text-to-speech engine using Kokoro-82M CoreML models.
 ///
 /// Uses split frontend (predictor, CPU) + backend (decoder, ANE) CoreML
-/// models per bucket size for ~12x faster inference vs monolithic models.
+/// models per bucket size for fast Neural Engine inference.
 ///
 /// ```swift
 /// let engine = try KokoroEngine(modelDirectory: myModelPath)
@@ -249,7 +249,7 @@ public final class KokoroEngine: @unchecked Sendable {
             }
             selectedBucket = useBucket
 
-            var (samples, durations) = try synthesizeUnified(
+            var (samples, durations) = try synthesizeChunk(
                 tokenIds: tokenIds, styleVector: styleVector, speed: clampedSpeed,
                 bucket: useBucket)
 
@@ -289,7 +289,7 @@ public final class KokoroEngine: @unchecked Sendable {
             do {
                 let dummyTokens = [Int](repeating: 0, count: bucket.maxTokens)
                 let dummyStyle = [Float](repeating: 0, count: VoiceStore.styleDim)
-                _ = try synthesizeUnified(
+                _ = try synthesizeChunk(
                     tokenIds: dummyTokens, styleVector: dummyStyle, speed: 1.0,
                     bucket: bucket)
             } catch {
@@ -395,7 +395,7 @@ public final class KokoroEngine: @unchecked Sendable {
         return chunks
     }
 
-    private func synthesizeUnified(
+    private func synthesizeChunk(
         tokenIds: [Int],
         styleVector: [Float],
         speed: Float,
@@ -603,7 +603,7 @@ public final class KokoroEngine: @unchecked Sendable {
                                 forTokenCount: tokenIds.count, available: self.activeBuckets)
                             ?? self.activeBuckets.last!
 
-                        var (samples, _) = try self.synthesizeUnified(
+                        var (samples, _) = try self.synthesizeChunk(
                             tokenIds: tokenIds, styleVector: styleVector,
                             speed: clampedSpeed, bucket: bucket)
 
