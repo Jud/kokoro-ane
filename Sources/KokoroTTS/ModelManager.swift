@@ -26,16 +26,21 @@ public enum ModelManager {
 
     /// Check whether enough models exist to run inference.
     ///
-    /// Requires at least one `.mlmodelc` model bundle and a `voices/` directory.
+    /// Requires at least one frontend+backend `.mlmodelc` pair and a `voices/` directory.
     public static func modelsAvailable(at directory: URL) -> Bool {
         let fm = FileManager.default
-        let hasModel = modelFiles.contains { file in
-            fm.fileExists(atPath: directory.appendingPathComponent(file).path)
+        let hasModel = ModelBucket.allCases.contains { bucket in
+            fm.fileExists(
+                atPath: directory.appendingPathComponent(
+                    bucket.frontendModelName + ".mlmodelc"
+                ).path)
+                && fm.fileExists(
+                    atPath: directory.appendingPathComponent(
+                        bucket.backendModelName + ".mlmodelc"
+                    ).path)
         }
         let hasVoices = fm.fileExists(
             atPath: directory.appendingPathComponent("voices").path)
         return hasModel && hasVoices
     }
-
-    private static let modelFiles = ModelBucket.allCases.map { $0.modelName + ".mlmodelc" }
 }

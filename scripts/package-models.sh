@@ -16,8 +16,10 @@ echo "Packaging models from: $MODEL_DIR"
 
 cd "$MODEL_DIR"
 tar czf "$OLDPWD/$OUTPUT" \
-    kokoro_21_5s.mlmodelc \
-    kokoro_24_10s.mlmodelc \
+    kokoro_21_5s_frontend.mlmodelc \
+    kokoro_21_5s_backend.mlmodelc \
+    kokoro_24_10s_frontend.mlmodelc \
+    kokoro_24_10s_backend.mlmodelc \
     voices
 
 cd "$OLDPWD"

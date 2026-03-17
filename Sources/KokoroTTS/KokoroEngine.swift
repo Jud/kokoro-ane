@@ -19,6 +19,12 @@ public enum ModelBucket: String, CaseIterable, Sendable, Comparable {
         }
     }
 
+    /// Frontend model bundle name.
+    public var frontendModelName: String { modelName + "_frontend" }
+
+    /// Backend model bundle name.
+    public var backendModelName: String { modelName + "_backend" }
+
     /// Maximum input token count for this bucket.
     public var maxTokens: Int {
         switch self {
@@ -43,9 +49,8 @@ public enum ModelBucket: String, CaseIterable, Sendable, Comparable {
 
 /// High-quality text-to-speech engine using Kokoro-82M CoreML models.
 ///
-/// Uses unified end-to-end models (StyleTTS2 + iSTFTNet vocoder) with one
-/// CoreML model per bucket size. Runs on the Apple Neural Engine for 3.5x
-/// faster inference vs GPU.
+/// Uses split frontend (predictor, CPU) + backend (decoder, ANE) CoreML
+/// models per bucket size for ~12x faster inference vs monolithic models.
 ///
 /// ```swift
 /// let engine = try KokoroEngine(modelDirectory: myModelPath)
@@ -69,6 +74,9 @@ public final class KokoroEngine: @unchecked Sendable {
     /// Number of random phase channels for the iSTFTNet vocoder.
     private static let numPhases = 9
 
+    /// Style content dimension (first half of the full 256-dim style vector).
+    private static let sContentDim = VoiceStore.styleDim / 2
+
     /// Safety margin subtracted from max bucket tokens when chunking phonemes.
     private static let tokenPadding = 7
 
@@ -85,17 +93,23 @@ public final class KokoroEngine: @unchecked Sendable {
         static let predDurClamped = "pred_dur_clamped"
         static let predDur = "pred_dur"
         static let speed = "speed"
+        static let asr = "asr"
+        static let f0Pred = "F0_pred"
+        static let nPred = "N_pred"
+        static let sContent = "s_content"
+        static let har = "har"
     }
 
-    /// Per-bucket CoreML model and pre-allocated buffers.
+    /// Per-bucket CoreML models and pre-allocated buffers.
     private struct BucketResources {
-        let model: MLModel
+        let frontend: MLModel  // CPU_ONLY
+        let backend: MLModel  // .all (ANE preferred)
         let inputIds: MLMultiArray
         let mask: MLMultiArray
         let refS: MLMultiArray
+        let sContent: MLMultiArray
         let randomPhases: MLMultiArray
         let speed: MLMultiArray
-        let hasSpeed: Bool
     }
 
     private static let logger = Logger(
@@ -139,31 +153,43 @@ public final class KokoroEngine: @unchecked Sendable {
 
         self.voiceStore = try VoiceStore(directory: modelDirectory.appendingPathComponent("voices"))
 
-        let config = MLModelConfiguration()
-        config.computeUnits = .cpuAndNeuralEngine
+        let feConfig = MLModelConfiguration()
+        feConfig.computeUnits = .cpuOnly
+        let beConfig = MLModelConfiguration()
+        beConfig.computeUnits = .all
 
         var resources: [ModelBucket: BucketResources] = [:]
         for bucket in ModelBucket.allCases {
-            let url = modelDirectory.appendingPathComponent(bucket.modelName + ".mlmodelc")
-            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let feURL = modelDirectory.appendingPathComponent(
+                bucket.frontendModelName + ".mlmodelc")
+            let beURL = modelDirectory.appendingPathComponent(
+                bucket.backendModelName + ".mlmodelc")
+            guard FileManager.default.fileExists(atPath: feURL.path),
+                FileManager.default.fileExists(atPath: beURL.path)
+            else { continue }
             do {
                 let maxTokens = bucket.maxTokens
-                let modelObj = try MLModel(contentsOf: url, configuration: config)
+
+                let frontend = try MLModel(contentsOf: feURL, configuration: feConfig)
+                let backend = try MLModel(contentsOf: beURL, configuration: beConfig)
+
                 let res = BucketResources(
-                    model: modelObj,
+                    frontend: frontend,
+                    backend: backend,
                     inputIds: try MLMultiArray(
                         shape: [1, maxTokens as NSNumber], dataType: .int32),
                     mask: try MLMultiArray(
                         shape: [1, maxTokens as NSNumber], dataType: .int32),
                     refS: try MLMultiArray(
                         shape: [1, VoiceStore.styleDim as NSNumber], dataType: .float32),
+                    sContent: try MLMultiArray(
+                        shape: [1, Self.sContentDim as NSNumber], dataType: .float32),
                     randomPhases: try MLMultiArray(
                         shape: [1, Self.numPhases as NSNumber], dataType: .float32),
-                    speed: try MLMultiArray(shape: [1], dataType: .float32),
-                    hasSpeed: modelObj.modelDescription.inputDescriptionsByName[Feature.speed] != nil
+                    speed: try MLMultiArray(shape: [1], dataType: .float32)
                 )
                 resources[bucket] = res
-                Self.logger.info("Loaded \(bucket.modelName) (\(maxTokens) tokens)")
+                Self.logger.info("Loaded \(bucket.modelName) frontend+backend (\(maxTokens) tokens)")
             } catch {
                 Self.logger.warning("Failed to load \(bucket.modelName): \(error)")
             }
@@ -386,30 +412,55 @@ public final class KokoroEngine: @unchecked Sendable {
         synthesizeLock.lock()
         defer { synthesizeLock.unlock() }
 
+        // --- Frontend: predictor + GeneratorFrontEnd (CPU) ---
         MLArrayHelpers.fillTokenInputs(
             from: tokenIds, into: res.inputIds, mask: res.mask, maxLength: bucket.maxTokens)
         MLArrayHelpers.fillStyleArray(from: styleVector, into: res.refS)
+        res.speed[0] = speed as NSNumber
 
         let phasePtr = res.randomPhases.dataPointer.assumingMemoryBound(to: Float.self)
         for i in 0..<Self.numPhases {
             phasePtr[i] = Float.random(in: 0..<(2 * .pi))
         }
 
-        res.speed[0] = speed as NSNumber
-
-        var dict: [String: MLFeatureValue] = [
+        let frontendInput = try MLDictionaryFeatureProvider(dictionary: [
             Feature.inputIds: MLFeatureValue(multiArray: res.inputIds),
             Feature.attentionMask: MLFeatureValue(multiArray: res.mask),
             Feature.refS: MLFeatureValue(multiArray: res.refS),
+            Feature.speed: MLFeatureValue(multiArray: res.speed),
             Feature.randomPhases: MLFeatureValue(multiArray: res.randomPhases),
-        ]
-        if res.hasSpeed {
-            dict[Feature.speed] = MLFeatureValue(multiArray: res.speed)
-        }
-        let input = try MLDictionaryFeatureProvider(dictionary: dict)
+        ])
 
         let predictionStart = CFAbsoluteTimeGetCurrent()
-        let output = try res.model.prediction(from: input)
+        let feOutput = try res.frontend.prediction(from: frontendInput)
+
+        guard let asr = feOutput.featureValue(for: Feature.asr)?.multiArrayValue,
+            let f0Pred = feOutput.featureValue(for: Feature.f0Pred)?.multiArrayValue,
+            let nPred = feOutput.featureValue(for: Feature.nPred)?.multiArrayValue,
+            let har = feOutput.featureValue(for: Feature.har)?.multiArrayValue
+        else {
+            throw KokoroError.inferenceFailed("Missing frontend outputs")
+        }
+
+        // --- Backend: DecoderBackEnd (ANE, ~112ms, no atan2) ---
+        let sContentPtr = res.sContent.dataPointer.assumingMemoryBound(to: Float.self)
+        let sCount = min(styleVector.count, Self.sContentDim)
+        styleVector.withUnsafeBufferPointer { src in
+            sContentPtr.update(from: src.baseAddress!, count: sCount)
+        }
+        if sCount < Self.sContentDim {
+            sContentPtr.advanced(by: sCount).update(repeating: 0, count: Self.sContentDim - sCount)
+        }
+
+        let backendInput = try MLDictionaryFeatureProvider(dictionary: [
+            Feature.asr: MLFeatureValue(multiArray: asr),
+            Feature.f0Pred: MLFeatureValue(multiArray: f0Pred),
+            Feature.nPred: MLFeatureValue(multiArray: nPred),
+            Feature.sContent: MLFeatureValue(multiArray: res.sContent),
+            Feature.har: MLFeatureValue(multiArray: har),
+        ])
+
+        let beOutput = try res.backend.prediction(from: backendInput)
         let predictionElapsed = CFAbsoluteTimeGetCurrent() - predictionStart
 
         if predictionElapsed > Self.slowPredictionThreshold {
@@ -418,14 +469,15 @@ public final class KokoroEngine: @unchecked Sendable {
                 "\(bucket.modelName) prediction took \(ms)ms (possible ANE fallback to CPU/GPU)")
         }
 
-        guard let audio = output.featureValue(for: Feature.audio)?.multiArrayValue else {
+        guard let audio = beOutput.featureValue(for: Feature.audio)?.multiArrayValue else {
             throw KokoroError.inferenceFailed("Missing audio output")
         }
 
+        // Durations and audio length come from frontend
         let durations: [Int]
         let predDur =
-            output.featureValue(for: Feature.predDurClamped)?.multiArrayValue
-            ?? output.featureValue(for: Feature.predDur)?.multiArrayValue
+            feOutput.featureValue(for: Feature.predDurClamped)?.multiArrayValue
+            ?? feOutput.featureValue(for: Feature.predDur)?.multiArrayValue
         if let predDur {
             durations = (0..<min(predDur.count, tokenIds.count)).map { predDur[$0].intValue }
         } else {
@@ -433,7 +485,7 @@ public final class KokoroEngine: @unchecked Sendable {
         }
 
         let validSamples: Int
-        if let lengthArray = output.featureValue(for: Feature.audioLength)?.multiArrayValue,
+        if let lengthArray = feOutput.featureValue(for: Feature.audioLength)?.multiArrayValue,
             lengthArray[0].intValue > 0, lengthArray[0].intValue <= audio.count
         {
             validSamples = lengthArray[0].intValue

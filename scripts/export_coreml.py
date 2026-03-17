@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Export Kokoro-82M from PyTorch to CoreML models for kokoro-tts-swift.
+"""Export Kokoro-82M from PyTorch to split CoreML models for kokoro-tts-swift.
 
-Creates two fixed-size CoreML models:
-  - kokoro_21_5s.mlmodelc  (max 124 tokens, ~5s audio)
-  - kokoro_24_10s.mlmodelc (max 242 tokens, ~10s audio)
+Creates frontend + backend CoreML model pairs per bucket:
+  - {bucket}_frontend.mlmodelc  (predictor, CPU_ONLY, ~5ms)
+  - {bucket}_backend.mlmodelc   (decoder, ANE-eligible, ~112ms)
 
 Usage:
     .venv/bin/python scripts/export_coreml.py [--output-dir ./models_export]
@@ -236,6 +236,7 @@ BUCKETS = {
 
 SAMPLES_PER_FRAME = 600  # decoder upsample (2x) * generator (10*6*5=300)
 NUM_HARMONICS = 9        # fundamental + 8 overtones
+S_CONTENT_DIM = 128      # first half of 256-dim style vector (content style)
 
 
 # ---------------------------------------------------------------------------
@@ -306,17 +307,6 @@ def patch_sinegen_for_export(model):
     # Replace pow(sin,2) with mul in Snake activations
     _patch_snake_mul(model)
 
-    # Round InstanceNorm output to float16 in AdaIN — InstanceNorm's
-    # reduction ops (mean, var) diverge most between float32 and float16
-    from kokoro.istftnet import AdaIN1d
-    _orig_adain_forward = AdaIN1d.forward
-    def _fp16_norm_forward(self, x, s):
-        h = self.fc(s)
-        h = h.view(h.size(0), h.size(1), 1)
-        gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        return (1 + gamma) * self.norm(x).half().float() + beta
-    AdaIN1d.forward = _fp16_norm_forward
-
     # Eliminate dead noise in SourceModuleHnNSF — noi_source is never used
     # in the generator, and randn_like in the trace creates unnecessary ops
     from kokoro.istftnet import SourceModuleHnNSF
@@ -326,15 +316,6 @@ def patch_sinegen_for_export(model):
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         return sine_merge, torch.zeros_like(uv), uv
     SourceModuleHnNSF.forward = _no_noise_source_forward
-
-    # Pre-round weights AND buffers to float16 precision — ANE uses float16
-    # internally, so rounding makes PyTorch reference match ANE's actual computation
-    with torch.no_grad():
-        for p in model.parameters():
-            p.data = p.data.half().float()
-        for b in model.buffers():
-            if b.is_floating_point():
-                b.data = b.data.half().float()
 
     # Set external phases on all SineGen instances
     def set_phases(module, phases):
@@ -368,19 +349,18 @@ def load_kokoro_model():
 
 
 # ---------------------------------------------------------------------------
-# Fixed-shape wrapper for export
+# Split pipeline wrappers for export
 # ---------------------------------------------------------------------------
-class KokoroStaticWrapper(nn.Module):
-    """Fixed-shape wrapper for CoreML export.
+class KokoroModelA(nn.Module):
+    """Frontend: predictor (stages 1-5) + GeneratorFrontEnd (SineGen/STFT).
 
-    Takes raw token IDs and produces audio. All intermediate tensors
-    use fixed maximum sizes determined by the bucket config.
+    Runs on CPU_ONLY. Keeps atan2 (in STFT.transform) off the ANE.
+    Matches stageharness dec_pipe frontend + SplitA_Predictor.
     """
 
     def __init__(self, model, max_tokens, max_audio, set_phases_fn):
         super().__init__()
         self.max_tokens = max_tokens
-        self.max_audio = max_audio
         self.max_frames = max_audio // SAMPLES_PER_FRAME
         self.set_phases_fn = set_phases_fn
 
@@ -388,76 +368,88 @@ class KokoroStaticWrapper(nn.Module):
         self.bert_encoder = model.bert_encoder
         self.predictor = model.predictor
         self.text_encoder = model.text_encoder
-        self.decoder = model.decoder
+        self.gen_frontend = GeneratorFrontEnd(model.decoder.generator)
 
     def forward(self, input_ids, attention_mask, ref_s, speed, random_phases):
         """
         Args:
-            input_ids:       [1, max_tokens] int32 — token IDs (0-padded)
-            attention_mask:  [1, max_tokens] int32 — 1=real, 0=padding
-            ref_s:           [1, 256] float32 — voice style embedding
-            speed:           [1] float32 — speed factor
-            random_phases:   [1, 9] float32 — harmonic phase offsets
+            input_ids:       [1, max_tokens] int32
+            attention_mask:  [1, max_tokens] int32
+            ref_s:           [1, 256] float32
+            speed:           [1] float32
+            random_phases:   [1, 9] float32
         Returns:
-            audio:           [1, 1, max_audio] float32 — waveform (silence-padded)
-            audio_length:    [1] int32 — number of valid audio samples
-            pred_dur:        [1, max_tokens] float32 — per-token durations
+            asr:                  [1, 512, max_frames] float32
+            F0_pred:              [1, F0_frames] float32
+            N_pred:               [1, F0_frames] float32
+            har:                  [1, har_channels, har_frames] float32
+            audio_length_samples: [1] int32
+            pred_dur_clamped:     [1, max_tokens] float32
         """
-        # Set external phases on all SineGen instances
-        self.set_phases_fn(self.decoder, random_phases)
+        self.set_phases_fn(self.gen_frontend, random_phases)
 
         input_lengths = attention_mask.sum(dim=1).long()
-        text_mask = (attention_mask == 0)  # True for padding positions
+        text_mask = (attention_mask == 0)
 
-        # BERT encoding
         bert_dur = self.bert(input_ids, attention_mask=attention_mask)
         d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
 
-        s = ref_s[:, 128:]  # style for predictor
+        s = ref_s[:, S_CONTENT_DIM:]
 
-        # Duration prediction
         d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
         x, _ = self.predictor.lstm(d)
         duration = self.predictor.duration_proj(x)
         duration = torch.sigmoid(duration).sum(dim=-1) / speed[0]
         pred_dur = torch.round(duration).clamp(min=1).long()
-
-        # Zero out padding token durations
         pred_dur = pred_dur * attention_mask.long()
 
-        # Static alignment matrix using cumsum (avoids dynamic repeat_interleave)
-        cumsum = torch.cumsum(pred_dur, dim=-1)  # [1, max_tokens]
-        total_frames = cumsum[0, -1]
-
-        # Fixed-size frame indices (max_frames)
+        cumsum = torch.cumsum(pred_dur, dim=-1)
         frame_indices = torch.arange(
             self.max_frames, device=input_ids.device
-        ).unsqueeze(0)  # [1, max_frames]
-
-        starts = F.pad(cumsum[:, :-1], (1, 0))  # [1, max_tokens]
-
-        # Alignment: pred_aln_trg[b, t, f] = 1 iff frame f belongs to token t
+        ).unsqueeze(0)
+        starts = F.pad(cumsum[:, :-1], (1, 0))
         pred_aln_trg = (
             (frame_indices.unsqueeze(1) >= starts.unsqueeze(2)) &
             (frame_indices.unsqueeze(1) < cumsum.unsqueeze(2))
-        ).float()  # [1, max_tokens, max_frames]
+        ).float()
 
-        # Apply alignment to get frame-level features
-        en = d.transpose(-1, -2) @ pred_aln_trg  # [1, 640, max_frames]
+        en = d.transpose(-1, -2) @ pred_aln_trg
         F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
 
         t_en = self.text_encoder(input_ids, input_lengths, text_mask)
-        asr = t_en @ pred_aln_trg  # [1, 512, max_frames]
+        asr = t_en @ pred_aln_trg
 
-        # Decode to audio (fixed output length = max_frames * SAMPLES_PER_FRAME)
-        audio = self.decoder(
-            asr, F0_pred, N_pred, ref_s[:, :128]
-        )  # [1, 1, max_audio]
+        # GeneratorFrontEnd: SineGen + STFT.transform (atan2 stays on CPU)
+        har = self.gen_frontend(F0_pred)
 
-        # Audio length from predicted durations
-        audio_length = (total_frames * SAMPLES_PER_FRAME).int().unsqueeze(0)
+        audio_length = (cumsum[:, -1].float() * float(SAMPLES_PER_FRAME)).int()
 
-        return audio, audio_length, pred_dur.float()
+        return asr, F0_pred, N_pred, har, audio_length, pred_dur.float()
+
+
+class KokoroModelB(nn.Module):
+    """Backend: DecoderBackEnd (decoder preprocessing + generator backend).
+
+    Runs on ALL (ANE-eligible). No atan2/SineGen/STFT.transform — those
+    are in Model A. Matches stageharness DecoderBackEnd.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.decoder_backend = DecoderBackEnd(model.decoder)
+
+    def forward(self, asr, F0_pred, N_pred, s_content, har):
+        """
+        Args:
+            asr:        [1, 512, max_frames] float32
+            F0_pred:    [1, F0_frames] float32
+            N_pred:     [1, F0_frames] float32
+            s_content:  [1, 128] float32
+            har:        [1, har_channels, har_frames] float32
+        Returns:
+            audio:      [1, 1, max_audio] float32
+        """
+        return self.decoder_backend(asr, F0_pred, N_pred, s_content, har)
 
 
 # ---------------------------------------------------------------------------
@@ -467,33 +459,32 @@ def export_bucket(pipeline, model, set_phases_fn, bucket_name, bucket_config,
                   output_dir, verify=False):
     max_tokens = bucket_config["max_tokens"]
     max_audio = bucket_config["max_audio"]
+    max_frames = max_audio // SAMPLES_PER_FRAME
 
     print(f"\nExporting {bucket_name} (max_tokens={max_tokens}, max_audio={max_audio})")
 
-    wrapper = KokoroStaticWrapper(model, max_tokens, max_audio, set_phases_fn)
-    wrapper.eval()
+    # --- Frontend (Model A): predictor + GeneratorFrontEnd on CPU_ONLY ---
+    frontend = KokoroModelA(model, max_tokens, max_audio, set_phases_fn)
+    frontend.eval()
 
-    # Example inputs for tracing
-    example_ids = torch.zeros(1, max_tokens, dtype=torch.int64)
-    example_ids[0, :3] = torch.tensor([0, 50, 1])
-    example_mask = torch.zeros(1, max_tokens, dtype=torch.int64)
-    example_mask[0, :3] = 1
-    example_ref_s = torch.randn(1, 256)
-    example_speed = torch.tensor([1.0])
-    example_phases = torch.rand(1, NUM_HARMONICS) * 2 * torch.pi
+    fe_ids = torch.zeros(1, max_tokens, dtype=torch.int64)
+    fe_ids[0, :3] = torch.tensor([0, 50, 1])
+    fe_mask = torch.zeros(1, max_tokens, dtype=torch.int64)
+    fe_mask[0, :3] = 1
+    fe_ref_s = torch.randn(1, 256)
+    fe_speed = torch.tensor([1.0])
+    fe_phases = torch.rand(1, NUM_HARMONICS) * 2 * torch.pi
 
-    print("  Tracing model...")
+    print("  Tracing frontend...")
     with torch.no_grad():
-        traced = torch.jit.trace(
-            wrapper,
-            (example_ids, example_mask, example_ref_s,
-             example_speed, example_phases),
+        fe_traced = torch.jit.trace(
+            frontend, (fe_ids, fe_mask, fe_ref_s, fe_speed, fe_phases),
             check_trace=False,
         )
 
-    print("  Converting to CoreML...")
-    mlmodel = ct.convert(
-        traced,
+    print("  Converting frontend to CoreML...")
+    fe_model = ct.convert(
+        fe_traced,
         inputs=[
             ct.TensorType(name="input_ids", shape=(1, max_tokens), dtype=np.int32),
             ct.TensorType(name="attention_mask", shape=(1, max_tokens),
@@ -504,7 +495,10 @@ def export_bucket(pipeline, model, set_phases_fn, bucket_name, bucket_config,
                           dtype=np.float32),
         ],
         outputs=[
-            ct.TensorType(name="audio", dtype=np.float32),
+            ct.TensorType(name="asr", dtype=np.float32),
+            ct.TensorType(name="F0_pred", dtype=np.float32),
+            ct.TensorType(name="N_pred", dtype=np.float32),
+            ct.TensorType(name="har", dtype=np.float32),
             ct.TensorType(name="audio_length_samples", dtype=np.int32),
             ct.TensorType(name="pred_dur_clamped", dtype=np.float32),
         ],
@@ -513,75 +507,154 @@ def export_bucket(pipeline, model, set_phases_fn, bucket_name, bucket_config,
         convert_to="mlprogram",
     )
 
-    mlpackage_path = os.path.join(output_dir, f"{bucket_name}.mlpackage")
-    mlmodel.save(mlpackage_path)
-    print(f"  Saved {mlpackage_path}")
+    fe_pkg = os.path.join(output_dir, f"{bucket_name}_frontend.mlpackage")
+    fe_model.save(fe_pkg)
+    print(f"  Saved {fe_pkg}")
 
-    print("  Compiling to .mlmodelc...")
-    compile_result = subprocess.run(
-        ["xcrun", "coremlcompiler", "compile", mlpackage_path, output_dir],
-        capture_output=True, text=True
+    def _compile(pkg_path, name):
+        print(f"  Compiling {name}...")
+        result = subprocess.run(
+            ["xcrun", "coremlcompiler", "compile", pkg_path, output_dir],
+            capture_output=True, text=True)
+        compiled = os.path.join(output_dir,
+                                os.path.basename(pkg_path).replace(".mlpackage", ".mlmodelc"))
+        if result.returncode == 0 and os.path.exists(compiled):
+            print(f"  Compiled: {compiled}")
+        else:
+            print(f"  Compilation failed: {result.stderr[:200]}")
+
+    _compile(fe_pkg, "frontend")
+
+    # --- Backend (Model B): DecoderBackEnd on ALL (ANE-eligible, no atan2) ---
+    # Run frontend to get intermediate tensor shapes for tracing
+    with torch.no_grad():
+        asr, F0_pred, N_pred, har, _, _ = frontend(
+            fe_ids, fe_mask, fe_ref_s, fe_speed, fe_phases)
+
+    backend = KokoroModelB(model)
+    backend.eval()
+
+    be_s_content = torch.randn(1, S_CONTENT_DIM)
+
+    print("  Tracing backend...")
+    with torch.no_grad():
+        be_traced = torch.jit.trace(
+            backend, (asr, F0_pred, N_pred, be_s_content, har),
+            check_trace=False,
+        )
+
+    print(f"  Backend input shapes: asr={tuple(asr.shape)}, "
+          f"F0_pred={tuple(F0_pred.shape)}, har={tuple(har.shape)}")
+
+    print("  Converting backend to CoreML...")
+    be_model = ct.convert(
+        be_traced,
+        inputs=[
+            ct.TensorType(name="asr", shape=tuple(asr.shape),
+                          dtype=np.float32),
+            ct.TensorType(name="F0_pred", shape=tuple(F0_pred.shape),
+                          dtype=np.float32),
+            ct.TensorType(name="N_pred", shape=tuple(N_pred.shape),
+                          dtype=np.float32),
+            ct.TensorType(name="s_content", shape=(1, S_CONTENT_DIM), dtype=np.float32),
+            ct.TensorType(name="har", shape=tuple(har.shape),
+                          dtype=np.float32),
+        ],
+        outputs=[
+            ct.TensorType(name="audio", dtype=np.float32),
+        ],
+        minimum_deployment_target=ct.target.macOS15,
+        compute_precision=ct.precision.FLOAT32,
+        convert_to="mlprogram",
     )
-    compiled_path = os.path.join(output_dir, f"{bucket_name}.mlmodelc")
-    if compile_result.returncode == 0 and os.path.exists(compiled_path):
-        print(f"  Compiled: {compiled_path}")
-    else:
-        print(f"  Compilation failed: {compile_result.stderr[:200]}")
+
+    be_pkg = os.path.join(output_dir, f"{bucket_name}_backend.mlpackage")
+    be_model.save(be_pkg)
+    print(f"  Saved {be_pkg}")
+
+    _compile(be_pkg, "backend")
 
     if verify:
-        verify_export(pipeline, model, set_phases_fn, mlmodel,
-                      bucket_name, max_tokens)
+        verify_export(pipeline, model, set_phases_fn, fe_model, be_model,
+                      frontend, backend,
+                      bucket_name, max_tokens, max_frames)
 
-    return mlmodel
+    return fe_model, be_model
 
 
-def verify_export(pipeline, pytorch_model, set_phases_fn, coreml_model,
-                  bucket_name, max_tokens):
+def verify_export(pipeline, pytorch_model, set_phases_fn, fe_coreml,
+                  be_coreml, frontend_py, backend_py,
+                  bucket_name, max_tokens, max_frames):
+    """Compare PyTorch split wrappers vs CoreML split models (apples-to-apples)."""
     print(f"\n  Verifying {bucket_name}...")
 
     text = "Hello world, this is a test."
     phonemes, _ = pipeline.g2p(text)
-    token_ids = pipeline.tokenize(phonemes)
-    if hasattr(token_ids, 'tolist'):
-        token_ids = token_ids.tolist()
+    vocab = pytorch_model.vocab
+    raw = list(filter(lambda i: i is not None,
+        map(lambda p: vocab.get(p), phonemes)))
+    token_ids = [0] + raw + [0]
 
     seq_len = min(len(token_ids), max_tokens)
     token_ids = token_ids[:seq_len]
 
     voice_pack = pipeline.load_voice("af_heart")
-    ref_s_tensor = voice_pack[len(token_ids)]
+    ref_s_tensor = voice_pack[seq_len]
     if ref_s_tensor.dim() == 1:
         ref_s_tensor = ref_s_tensor.unsqueeze(0)
 
-    # Fixed phases for deterministic comparison
     phases = torch.rand(1, NUM_HARMONICS) * 2 * torch.pi
 
-    # Run PyTorch reference
-    set_phases_fn(pytorch_model.decoder, phases)
+    # Prepare fixed-size inputs
+    input_ids_t = torch.zeros(1, max_tokens, dtype=torch.int64)
+    input_ids_t[0, :seq_len] = torch.tensor(token_ids[:seq_len])
+    mask_t = torch.zeros(1, max_tokens, dtype=torch.int64)
+    mask_t[0, :seq_len] = 1
+
+    # Run PyTorch split pipeline as reference (reuse already-constructed wrappers)
     with torch.no_grad():
-        py_audio, py_dur = pytorch_model.forward_with_tokens(
-            torch.tensor([token_ids], dtype=torch.int64),
-            ref_s_tensor, 1.0,
-        )
-    py_audio_np = py_audio.numpy()
+        asr, F0_pred, N_pred, har, audio_len, pred_dur = frontend_py(
+            input_ids_t, mask_t, ref_s_tensor, torch.tensor([1.0]), phases)
+        py_audio = backend_py(
+            asr, F0_pred, N_pred, ref_s_tensor[:, :S_CONTENT_DIM], har)
 
-    # Run CoreML
-    input_ids = np.zeros((1, max_tokens), dtype=np.int32)
-    input_ids[0, :seq_len] = token_ids
-    mask = np.zeros((1, max_tokens), dtype=np.int32)
-    mask[0, :seq_len] = 1
+    py_len = int(audio_len[0].item())
+    py_audio_np = py_audio.flatten().numpy()[:py_len]
 
-    coreml_out = coreml_model.predict({
-        "input_ids": input_ids,
-        "attention_mask": mask,
+    # Reload with correct compute units (frontend CPU, backend ANE).
+    # mlProgram models require weights on disk, so save/reload via tmpdir.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fe_path = os.path.join(tmpdir, "fe.mlpackage")
+        be_path = os.path.join(tmpdir, "be.mlpackage")
+        fe_coreml.save(fe_path)
+        be_coreml.save(be_path)
+        fe_cpu = ct.models.MLModel(fe_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+        be_ane = ct.models.MLModel(be_path, compute_units=ct.ComputeUnit.ALL)
+
+    # Run CoreML split pipeline
+    input_ids_np = input_ids_t.numpy().astype(np.int32)
+    mask_np = mask_t.numpy().astype(np.int32)
+
+    fe_out = fe_cpu.predict({
+        "input_ids": input_ids_np,
+        "attention_mask": mask_np,
         "ref_s": ref_s_tensor.numpy().astype(np.float32),
         "speed": np.array([1.0], dtype=np.float32),
         "random_phases": phases.numpy().astype(np.float32),
     })
 
-    coreml_audio = coreml_out["audio"].flatten()
-    coreml_len = int(coreml_out["audio_length_samples"].flatten()[0])
-    coreml_audio = coreml_audio[:coreml_len]
+    s_content = ref_s_tensor[:, :S_CONTENT_DIM].numpy().astype(np.float32)
+    be_out = be_ane.predict({
+        "asr": fe_out["asr"].astype(np.float32),
+        "F0_pred": fe_out["F0_pred"].astype(np.float32),
+        "N_pred": fe_out["N_pred"].astype(np.float32),
+        "s_content": s_content,
+        "har": fe_out["har"].astype(np.float32),
+    })
+
+    coreml_len = int(fe_out["audio_length_samples"].flatten()[0])
+    coreml_audio = be_out["audio"].flatten()[:coreml_len]
 
     min_len = min(len(py_audio_np), len(coreml_audio))
     if min_len == 0:
@@ -604,7 +677,6 @@ def verify_export(pipeline, pytorch_model, set_phases_fn, coreml_model,
     else:
         print(f"  FAIL (correlation {corr:.4f})")
 
-    # Save both for listening
     import soundfile as sf
     os.makedirs("verify_output", exist_ok=True)
     sf.write(f"verify_output/{bucket_name}_pytorch.wav", py_audio_np, 24000)
