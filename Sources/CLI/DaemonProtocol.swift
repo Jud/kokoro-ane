@@ -15,46 +15,40 @@ struct SynthesisRequest: Codable {
     var text: String
     var voice: String
     var speed: Float
-    var raw: Bool
 }
 
 struct SynthesisResponse: Codable {
     var version: Int = DaemonConfig.protocolVersion
     var ok: Bool
     var error: String?
-    /// Raw PCM audio as bytes. Uses `Data` so CBOR encodes as a byte string.
-    var samples: Data?
+    var sampleCount: Int?
     var synthesisTime: Double?
     var phonemes: String?
     var tokenCount: Int?
-
-    /// Decode the raw sample bytes back to Float array.
-    var floatSamples: [Float]? {
-        guard let data = samples, !data.isEmpty,
-            data.count % MemoryLayout<Float>.size == 0
-        else { return nil }
-        return data.withUnsafeBytes { buf in
-            Array(buf.assumingMemoryBound(to: Float.self))
-        }
-    }
-
-    /// Encode Float samples to raw bytes for wire transfer.
-    static func encodeSamples(_ floats: [Float]) -> Data {
-        floats.withUnsafeBytes { Data($0) }
-    }
 }
 
 // MARK: - CBOR I/O
 
 enum DaemonIO {
     static func writeMessage<T: Encodable>(_ value: T, to fd: Int32) -> Bool {
-        guard let bytes = try? CBOREncoder().encode(value) else { return false }
+        let bytes: [UInt8]
+        do {
+            bytes = try CBOREncoder().encode(value)
+        } catch {
+            fputs("CBOR encode error: \(error)\n", stderr)
+            return false
+        }
         return LengthPrefixedIO.writeBytes(bytes, to: fd)
     }
 
     static func readMessage<T: Decodable>(_ type: T.Type, from fd: Int32) -> T? {
         guard let bytes = LengthPrefixedIO.readBytes(from: fd) else { return nil }
-        return try? CBORDecoder().decode(type, from: bytes)
+        do {
+            return try CBORDecoder().decode(type, from: bytes)
+        } catch {
+            fputs("CBOR decode error (\(type)): \(error)\n", stderr)
+            return nil
+        }
     }
 }
 
@@ -135,6 +129,27 @@ enum LengthPrefixedIO {
     static func writeBytes(_ bytes: [UInt8], to fd: Int32) -> Bool {
         guard writeLengthHeader(bytes.count, to: fd) else { return false }
         return bytes.withUnsafeBytes { writeFully(fd: fd, from: $0.baseAddress!, count: bytes.count) }
+    }
+
+    static func writeRawSamples(_ samples: [Float], to fd: Int32) -> Bool {
+        let byteCount = samples.count * MemoryLayout<Float>.size
+        guard writeLengthHeader(byteCount, to: fd) else { return false }
+        return samples.withUnsafeBytes { writeFully(fd: fd, from: $0.baseAddress!, count: byteCount) }
+    }
+
+    static func readRawSamples(count: Int, from fd: Int32) -> [Float]? {
+        var lengthBE: UInt32 = 0
+        let headerRead = withUnsafeMutableBytes(of: &lengthBE) { buf in
+            readFully(fd: fd, into: buf.baseAddress!, count: 4)
+        }
+        guard headerRead else { return nil }
+        let byteCount = Int(UInt32(bigEndian: lengthBE))
+        guard byteCount == count * MemoryLayout<Float>.size else { return nil }
+        var samples = [Float](repeating: 0, count: count)
+        let ok = samples.withUnsafeMutableBytes { buf in
+            readFully(fd: fd, into: buf.baseAddress!, count: byteCount)
+        }
+        return ok ? samples : nil
     }
 
     static func readBytes(from fd: Int32) -> [UInt8]? {

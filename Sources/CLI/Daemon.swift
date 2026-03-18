@@ -280,16 +280,17 @@ private func handleClient(fd: Int32, engine: KokoroEngine) {
     do {
         let result = try engine.synthesize(
             text: request.text, voice: request.voice,
-            speed: request.speed, rawAudio: request.raw)
+            speed: request.speed)
 
         let response = SynthesisResponse(
             ok: true,
-            samples: SynthesisResponse.encodeSamples(result.samples),
+            sampleCount: result.samples.count,
             synthesisTime: result.synthesisTime,
             phonemes: result.phonemes,
             tokenCount: result.tokenCount)
 
-        _ = DaemonIO.writeMessage(response, to: fd)
+        guard DaemonIO.writeMessage(response, to: fd) else { return }
+        _ = LengthPrefixedIO.writeRawSamples(result.samples, to: fd)
     } catch {
         _ = DaemonIO.writeMessage(
             SynthesisResponse(ok: false, error: error.localizedDescription), to: fd)

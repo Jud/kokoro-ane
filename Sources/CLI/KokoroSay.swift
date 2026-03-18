@@ -36,9 +36,6 @@ struct Say: AsyncParsableCommand {
     @Flag(name: [.short, .long], help: "Play audio through speakers")
     var play = false
 
-    @Flag(name: .long, help: "Skip audio post-processing")
-    var raw = false
-
     @Flag(name: .long, help: "Stream audio (start playback before full synthesis)")
     var stream = false
 
@@ -101,7 +98,7 @@ struct Say: AsyncParsableCommand {
         // Try daemon (unless --debug or --ipa which need local engine)
         if !debug && !ipa {
             let request = SynthesisRequest(
-                text: inputText, voice: voice, speed: speed, raw: raw)
+                text: inputText, voice: voice, speed: speed)
             switch DaemonClient.synthesize(request) {
             case .success(let response, let samples):
                 let duration = Double(samples.count) / KokoroEngine.audioFormat.sampleRate
@@ -145,10 +142,10 @@ struct Say: AsyncParsableCommand {
         let result: SynthesisResult
         if ipa {
             result = try engine.synthesize(
-                ipa: inputText, voice: voice, speed: speed, rawAudio: raw)
+                ipa: inputText, voice: voice, speed: speed)
         } else {
             result = try engine.synthesize(
-                text: inputText, voice: voice, speed: speed, rawAudio: raw)
+                text: inputText, voice: voice, speed: speed)
         }
 
         if debug { printDebugInfo(result: result) }

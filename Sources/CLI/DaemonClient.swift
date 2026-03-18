@@ -27,7 +27,14 @@ enum DaemonClient {
             return .daemonError(response.error ?? "Unknown daemon error")
         }
 
-        let samples = response.floatSamples ?? []
+        guard let sampleCount = response.sampleCount, sampleCount > 0 else {
+            return .success(response, [])
+        }
+
+        guard let samples = LengthPrefixedIO.readRawSamples(count: sampleCount, from: fd) else {
+            return .daemonError("Failed to read audio data")
+        }
+
         return .success(response, samples)
     }
 

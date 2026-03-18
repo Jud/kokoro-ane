@@ -1,5 +1,5 @@
 @preconcurrency import AVFoundation
-import Accelerate
+
 import CoreML
 import Foundation
 import os
@@ -126,9 +126,6 @@ public final class KokoroEngine: @unchecked Sendable {
 
     /// Safety margin subtracted from max bucket tokens when chunking phonemes.
     private static let tokenPadding = 7
-
-    /// Silence samples inserted between chunks (100ms at 24kHz).
-    private static let interChunkSilence = 2400
 
     private enum Feature {
         static let inputIds = "input_ids"
@@ -280,12 +277,10 @@ public final class KokoroEngine: @unchecked Sendable {
     ///     See ``availableVoices`` for valid names.
     ///   - speed: Speech rate multiplier (0.5 = half speed, 2.0 = double speed).
     ///     Clamped to 0.5...2.0. Default is 1.0.
-    ///   - rawAudio: If true, skip post-processing (HP filter, EQ, normalization).
     /// - Returns: Synthesis result with PCM samples and metadata.
     /// - Throws: ``KokoroError/voiceNotFound(_:)`` if the voice doesn't exist.
     public func synthesize(
-        text: String, voice: String, speed: Float = 1.0,
-        rawAudio: Bool = false
+        text: String, voice: String, speed: Float = 1.0
     ) throws -> SynthesisResult {
         let t0 = CFAbsoluteTimeGetCurrent()
         let clampedSpeed = Self.clampSpeed(speed)
@@ -293,7 +288,7 @@ public final class KokoroEngine: @unchecked Sendable {
 
         return try synthesizeTokens(
             phonemes: fullPhonemes, mergedIds: mergedIds, voice: voice,
-            speed: clampedSpeed, rawAudio: rawAudio, startTime: t0)
+            speed: clampedSpeed, startTime: t0)
     }
 
     /// Synthesize pre-phonemized IPA text to PCM audio samples.
@@ -305,12 +300,10 @@ public final class KokoroEngine: @unchecked Sendable {
     ///   - ipa: IPA phoneme string (e.g. `"hˈɛloʊ wˈɜːld"`).
     ///   - voice: Voice preset name.
     ///   - speed: Speech rate multiplier (0.5–2.0). Default 1.0.
-    ///   - rawAudio: If true, skip post-processing.
     /// - Returns: Synthesis result with PCM samples and metadata.
     /// - Throws: ``KokoroError/voiceNotFound(_:)`` if the voice doesn't exist.
     public func synthesize(
-        ipa: String, voice: String, speed: Float = 1.0,
-        rawAudio: Bool = false
+        ipa: String, voice: String, speed: Float = 1.0
     ) throws -> SynthesisResult {
         let t0 = CFAbsoluteTimeGetCurrent()
         let clampedSpeed = Self.clampSpeed(speed)
@@ -318,12 +311,12 @@ public final class KokoroEngine: @unchecked Sendable {
 
         return try synthesizeTokens(
             phonemes: ipa, mergedIds: mergedIds, voice: voice,
-            speed: clampedSpeed, rawAudio: rawAudio, startTime: t0)
+            speed: clampedSpeed, startTime: t0)
     }
 
     private func synthesizeTokens(
         phonemes: String, mergedIds: [[Int]], voice: String,
-        speed: Float, rawAudio: Bool, startTime: CFAbsoluteTime
+        speed: Float, startTime: CFAbsoluteTime
     ) throws -> SynthesisResult {
 
         var allSamples: [Float] = []
@@ -342,19 +335,13 @@ public final class KokoroEngine: @unchecked Sendable {
                 ?? activeBuckets.last!
             selectedBucket = useBucket
 
-            var (samples, durations) = try synthesizeChunk(
+            let (samples, durations) = try synthesizeChunk(
                 tokenIds: tokenIds, styleVector: styleVector, speed: speed,
                 bucket: useBucket)
 
-            applyFades(&samples)
-            if !allSamples.isEmpty {
-                allSamples.append(contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
-            }
             allSamples.append(contentsOf: samples)
             allDurations.append(contentsOf: durations)
         }
-
-        if !rawAudio { postProcess(&allSamples) }
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
         return SynthesisResult(
@@ -583,46 +570,6 @@ public final class KokoroEngine: @unchecked Sendable {
         return (samples, durations)
     }
 
-    /// Apply fade-in and fade-out to suppress transients.
-    private func applyFades(_ samples: inout [Float]) {
-        guard !samples.isEmpty else { return }
-        samples.withUnsafeMutableBufferPointer { buf in
-            let ptr = buf.baseAddress!
-            let fadeIn = min(120, buf.count)  // 5ms
-            var ramp: Float = 0
-            var step = 1.0 / Float(fadeIn)
-            vDSP_vrampmul(ptr, 1, &ramp, &step, ptr, 1, vDSP_Length(fadeIn))
-            let fadeOut = min(1200, buf.count)  // 50ms
-            let fadeStart = buf.count - fadeOut
-            ramp = 1.0
-            step = -1.0 / Float(fadeOut)
-            vDSP_vrampmul(ptr + fadeStart, 1, &ramp, &step, ptr + fadeStart, 1, vDSP_Length(fadeOut))
-        }
-    }
-
-    // Precomputed biquad coefficients for presence boost EQ.
-    // Peaking EQ: center=2.5kHz, Q=0.8, gain=+2dB at 24kHz sample rate.
-    private static let eqCoeffs: (nb0: Float, nb1: Float, nb2: Float, na1: Float, na2: Float) = {
-        let fc: Float = 2500.0
-        let fs = Float(sampleRate)
-        let gain = powf(10.0, 2.0 / 40.0)  // +2dB
-        let w0 = 2.0 * Float.pi * fc / fs
-        let sinW0 = sinf(w0)
-        let cosW0 = cosf(w0)
-        let alpha = sinW0 / (2.0 * 0.8)  // Q=0.8
-        let a0 = 1.0 + alpha / gain
-        return (
-            nb0: (1.0 + alpha * gain) / a0,
-            nb1: (-2.0 * cosW0) / a0,
-            nb2: (1.0 - alpha * gain) / a0,
-            na1: (-2.0 * cosW0) / a0,
-            na2: (1.0 - alpha / gain) / a0
-        )
-    }()
-
-    // Precomputed high-pass filter coefficient: alpha = 1 - (2π * 80Hz / sampleRate)
-    private static let hpAlpha: Float = 1.0 - (2.0 * .pi * 80.0 / Float(sampleRate))
-
     // MARK: - Streaming
 
     /// Audio format for streaming buffers (24kHz, mono, float32).
@@ -672,7 +619,6 @@ public final class KokoroEngine: @unchecked Sendable {
         return AsyncStream { continuation in
             let thread = Thread {
                 let format = Self.audioFormat
-                var isFirst = true
 
                 for tokenIds in mergedIds {
                     if Thread.current.isCancelled { break }
@@ -685,25 +631,13 @@ public final class KokoroEngine: @unchecked Sendable {
                                 forTokenCount: tokenIds.count, available: self.activeBuckets)
                             ?? self.activeBuckets.last!
 
-                        var (samples, _) = try self.synthesizeChunk(
+                        let (samples, _) = try self.synthesizeChunk(
                             tokenIds: tokenIds, styleVector: styleVector,
                             speed: clampedSpeed, bucket: bucket)
-
-                        self.applyFades(&samples)
-                        self.postProcess(&samples)
-
-                        if !isFirst,
-                            let gap = Self.makePCMBuffer(
-                                from: [Float](repeating: 0, count: Self.interChunkSilence),
-                                format: format)
-                        {
-                            continuation.yield(.audio(gap))
-                        }
 
                         if let buffer = Self.makePCMBuffer(from: samples, format: format) {
                             continuation.yield(.audio(buffer))
                         }
-                        isFirst = false
                     } catch {
                         Self.logger.error(
                             "Streaming chunk failed: \(error.localizedDescription)")
@@ -738,53 +672,6 @@ public final class KokoroEngine: @unchecked Sendable {
         return buffer
     }
 
-    /// Post-process audio in-place: high-pass filter, presence boost, peak normalize.
-    private func postProcess(_ samples: inout [Float]) {
-        guard samples.count > 1 else { return }
-
-        let alpha = Self.hpAlpha
-        let prechargeCount = min(240, samples.count)  // 10ms at 24kHz
-
-        var prev: Float = 0
-        var prevOut: Float = 0
-        for i in stride(from: prechargeCount - 1, through: 0, by: -1) {
-            let x = samples[i]
-            prevOut = (x - prev) + alpha * prevOut
-            prev = x
-        }
-
-        for i in 0..<samples.count {
-            let x = samples[i]
-            prevOut = (x - prev) + alpha * prevOut
-            prev = x
-            samples[i] = prevOut
-        }
-
-        let c = Self.eqCoeffs
-
-        var x1: Float = 0, x2: Float = 0, y1: Float = 0, y2: Float = 0
-        for i in stride(from: prechargeCount - 1, through: 0, by: -1) {
-            let x = samples[i]
-            let y = c.nb0 * x + c.nb1 * x1 + c.nb2 * x2 - c.na1 * y1 - c.na2 * y2
-            x2 = x1; x1 = x
-            y2 = y1; y1 = y
-        }
-
-        for i in 0..<samples.count {
-            let x = samples[i]
-            let y = c.nb0 * x + c.nb1 * x1 + c.nb2 * x2 - c.na1 * y1 - c.na2 * y2
-            x2 = x1; x1 = x
-            y2 = y1; y1 = y
-            samples[i] = y
-        }
-
-        var peak: Float = 0
-        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
-        if peak > 0.001 {
-            var scale = Float(0.95) / peak
-            vDSP_vsmul(samples, 1, &scale, &samples, 1, vDSP_Length(samples.count))
-        }
-    }
 }
 
 // MARK: - SpeakEvent

@@ -131,9 +131,8 @@ graph TD
     end
 
     subgraph "output"
-        I4 --> P1[fades + post-processing]
-        P1 -->|synthesize| O1[full audio array]
-        P1 -->|speak| O2[AsyncStream&lt;AVAudioPCMBuffer&gt;]
+        I4 -->|synthesize| O1[full audio array]
+        I4 -->|speak| O2[AsyncStream&lt;SpeakEvent&gt;]
     end
 ```
 
