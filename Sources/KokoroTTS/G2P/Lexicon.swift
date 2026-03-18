@@ -270,7 +270,9 @@ final class Lexicon {  // swiftlint:disable:this type_body_length
             return lookup(target, tag: nil, stress: -0.5, ctx: ctx)
         } else if let sym = Lexicon.symbolSet[word] {
             return lookup(sym, tag: nil, stress: nil, ctx: ctx)
-        } else if word.trimmingCharacters(in: CharacterSet(charactersIn: ".")).contains(".") {
+        } else if word.trimmingCharacters(in: CharacterSet(charactersIn: ".")).contains("."),
+            !word.contains(where: { $0.isNumber })
+        {
             let parts = word.split(separator: ".")
             if parts.map({ $0.count }).max() ?? 0 < 3 {
                 return getNNP(word)
@@ -556,6 +558,7 @@ final class Lexicon {  // swiftlint:disable:this type_body_length
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
+    // swiftlint:disable:next cyclomatic_complexity function_body_length
     private func getNumber(
         _ input: String, currency: String?, is_head: Bool, num_flags: String
     ) -> (String?, Int?) {
@@ -567,16 +570,15 @@ final class Lexicon {  // swiftlint:disable:this type_body_length
         }
 
         func extend_num(_ num: String, first: Bool = true, escape: Bool = false) {
-            let splits: [String]
+            let words: String
             if escape {
-                splits = num.split(whereSeparator: { !$0.isLetter }).map(String.init)
+                words = num
+            } else if let val = Decimal(string: num) {
+                words = num2Words.convert(val)
             } else {
-                if let val = Decimal(string: num) {
-                    splits = num2Words.convert(val).split(separator: " ").map(String.init)
-                } else {
-                    splits = num.split(whereSeparator: { !$0.isLetter }).map(String.init)
-                }
+                words = num
             }
+            let splits = words.split(whereSeparator: { !$0.isLetter }).map(String.init)
 
             for (i, w) in splits.enumerated() {
                 if w != "and" || num_flags.contains("&") {
@@ -634,23 +636,6 @@ final class Lexicon {  // swiftlint:disable:this type_body_length
             } else {
                 extend_num(num)
             }
-        } else if word.filter({ $0 == "." }).count > 1 || !is_head {
-            var first = true
-            for num in word.replacingOccurrences(of: ",", with: "").split(separator: ".").map(
-                String.init)
-            {
-                if num.isEmpty {
-                } else if num.first == "0"
-                    || (num.count != 2 && num.dropFirst().contains(where: { $0 != "0" }))
-                {
-                    for n in num {
-                        extend_num(String(n), first: false)
-                    }
-                } else {
-                    extend_num(num, first: first)
-                }
-                first = false
-            }
         } else if let curr = currency, let units = Lexicon.currencies[curr], isCurrency(word) {
             var pairs: [(Int, String)] = []
             let parts = word.replacingOccurrences(of: ",", with: "").split(separator: ".")
@@ -674,6 +659,20 @@ final class Lexicon {  // swiftlint:disable:this type_body_length
                     }
                 } else {
                     appendLookup(unit, s: nil)
+                }
+            }
+        } else if word.contains(".") {
+            let parts = word.replacingOccurrences(of: ",", with: "").split(separator: ".").map(
+                String.init)
+            for (idx, num) in parts.enumerated() {
+                if idx > 0 { appendLookup("point", s: -2.0) }
+                if num.isEmpty {
+                } else if idx > 0 || num.first == "0" {
+                    for n in num {
+                        extend_num(String(n), first: false)
+                    }
+                } else {
+                    extend_num(num, first: idx == 0)
                 }
             }
         } else {

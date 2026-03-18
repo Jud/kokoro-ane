@@ -17,7 +17,7 @@ struct EnglishNum2Word {
         (1000, "thousand"), (100, "hundred"),
         (90, "ninety"), (80, "eighty"), (70, "seventy"),
         (60, "sixty"), (50, "fifty"), (40, "forty"),
-        (30, "thirty"),
+        (30, "thirty"), (20, "twenty"),
     ]
 
     private let lowNumWords = [
@@ -84,7 +84,7 @@ struct EnglishNum2Word {
             lastWord += "th"
         }
 
-        lastWords[lastWords.count - 1] = lastWord.capitalized
+        lastWords[lastWords.count - 1] = lastWord
         outWords[outWords.count - 1] = lastWords.joined(separator: "-")
         return outWords.joined(separator: " ")
     }

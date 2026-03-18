@@ -16,27 +16,33 @@ struct G2PReferenceTests {
         let phonemes: String
     }
 
+    // Minor stress/punctuation differences that don't affect speech quality
+    static let knownDiffs: Set<String> = [
+        // Primary vs secondary stress on "that" — function word stress assignment
+        "That costs $1.50.",
+        // Curly quote handling + final stress on "be"
+        "\"To be or not to be.\"",
+    ]
+
+    // swiftlint:disable force_try
     static let references: [ReferenceEntry] = {
         let url = Bundle.module.url(forResource: "kokoro_g2p_reference", withExtension: "json")!
         let data = try! Data(contentsOf: url)
         return try! JSONDecoder().decode([ReferenceEntry].self, from: data)
     }()
+    // swiftlint:enable force_try
 
     @Test("G2P matches Python Misaki reference", arguments: references)
     func matchesReference(entry: ReferenceEntry) {
         let g2p = EnglishG2P(british: false)
         let (phonemes, _) = g2p.phonemize(text: entry.text)
 
-        if phonemes != entry.phonemes {
-            // Log the diff but don't fail — minor IPA differences are expected
-            // between our port and the Python original. What matters is that
-            // the phonemes are valid and produce intelligible speech.
-            Issue.record(
-                """
-                G2P mismatch for: \(entry.text)
-                  expected: \(entry.phonemes)
-                  got:      \(phonemes)
-                """)
+        if Self.knownDiffs.contains(entry.text) {
+            withKnownIssue {
+                #expect(phonemes == entry.phonemes)
+            }
+        } else {
+            #expect(phonemes == entry.phonemes)
         }
     }
 }

@@ -78,5 +78,97 @@
   {
     "text": "The children played outside.",
     "phonemes": "ðə ʧˈɪldɹᵊn plˈAd ˌWtsˈId."
+  },
+  {
+    "text": "25 people arrived.",
+    "phonemes": "twˈɛnti fˈIv pˈipᵊl əɹˈIvd."
+  },
+  {
+    "text": "She scored 99 percent.",
+    "phonemes": "ʃˌi skˈɔɹd nˈIndi nˈIn pəɹsˈɛnt."
+  },
+  {
+    "text": "The year was 1999.",
+    "phonemes": "ðə jˈɪɹ wʌz nˌIntˈin nˈIndi nˈIn."
+  },
+  {
+    "text": "Call 911 immediately.",
+    "phonemes": "kˈɔl nˈIn hˈʌndɹəd əlˈɛvᵊn ɪmˈidiətli."
+  },
+  {
+    "text": "Room 404 is empty.",
+    "phonemes": "ɹˈum fˈɔɹ hˈʌndɹəd fˈɔɹ ɪz ˈɛmpti."
+  },
+  {
+    "text": "He ran 3.14 miles.",
+    "phonemes": "hˌi ɹˈæn θɹˈi pYnt wˈʌn fˈɔɹ mˈIlz."
+  },
+  {
+    "text": "It weighs 0.5 kilograms.",
+    "phonemes": "ˌɪt wˈAz zˈɪɹO pYnt fˈIv kˈɪləɡɹˌæmz."
+  },
+  {
+    "text": "The price is $5.",
+    "phonemes": "ðə pɹˈIs ɪz fˈIv dˈɑləɹz."
+  },
+  {
+    "text": "That costs $1.50.",
+    "phonemes": "ðˈæt kˈɔsts wˈʌn dˈɑləɹ ænd fˈɪfti sˈɛnts."
+  },
+  {
+    "text": "Add 2 cups of flour.",
+    "phonemes": "ˈæd tˈu kˈʌps ʌv flˈWəɹ."
+  },
+  {
+    "text": "The FBI investigated.",
+    "phonemes": "ði ˌɛfbˌiˈI ɪnvˈɛstəɡˌATᵻd."
+  },
+  {
+    "text": "She works at NASA.",
+    "phonemes": "ʃˌi wˈɜɹks æt nˈæsə."
+  },
+  {
+    "text": "Open the URL in Safari.",
+    "phonemes": "ˈOpᵊn ðə jˌuˌɑɹˈɛl ɪn səfˈɑɹi."
+  },
+  {
+    "text": "UIViewController is a class.",
+    "phonemes": "jˌuˈI vjˈu kəntɹˈOləɹ ɪz ɐ klˈæs."
+  },
+  {
+    "text": "Check the iOS settings.",
+    "phonemes": "ʧˈɛk ði ˌIOˈɛs sˈɛTɪŋz."
+  },
+  {
+    "text": "The 2nd place winner.",
+    "phonemes": "ðə sˈɛkənd plˈAs wˈɪnəɹ."
+  },
+  {
+    "text": "Her 21st birthday party.",
+    "phonemes": "hˌɜɹ twˈɛnti fˈɜɹst bˈɜɹθdˌA pˈɑɹTi."
+  },
+  {
+    "text": "The 100th anniversary.",
+    "phonemes": "ðə wˈʌn hˈʌndɹədθ ˌænəvˈɜɹsəɹi."
+  },
+  {
+    "text": "It's raining cats and dogs.",
+    "phonemes": "ˌɪts ɹˈAnɪŋ kˈæts ænd dˈɔɡz."
+  },
+  {
+    "text": "The dog's bone was buried.",
+    "phonemes": "ðə dˈɔɡz bˈOn wʌz bˈɛɹid."
+  },
+  {
+    "text": "Wait... what happened?",
+    "phonemes": "wˈAt... wˌʌt hˈæpənd?"
+  },
+  {
+    "text": "Hello; goodbye.",
+    "phonemes": "həlˈO; ɡˌʊdbˈI."
+  },
+  {
+    "text": "\"To be or not to be.\"",
+    "phonemes": "“tə bi ɔɹ nˌɑt tə bˈi.”"
   }
 ]

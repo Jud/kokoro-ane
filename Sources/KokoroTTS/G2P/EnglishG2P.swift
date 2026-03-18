@@ -291,7 +291,7 @@ final class EnglishG2P {
                 if token.meta.prespace,
                     !phonemeBuilder.isEmpty,
                     !(phonemeBuilder.last?.isWhitespace ?? false),
-                    token.phonemes != nil
+                    token.phonemes?.isEmpty == false
                 {
                     phonemeBuilder += " "
                 }
@@ -417,7 +417,8 @@ final class EnglishG2P {
                     }
                     token.meta.rating = 4
                 } else if currency != nil {
-                    if token.tag != .number {
+                    let looksNumeric = token.text.contains(where: { $0.isNumber })
+                    if token.tag != .number && !looksNumeric {
                         currency = nil
                     } else if j + 1 == subtokens.count
                         && (i + 1 == tokens.count || tokens[i + 1].tag != .number)
@@ -435,6 +436,15 @@ final class EnglishG2P {
                     {
                         token.meta.alias = "to"
                     }
+                }
+
+                // Re-tag otherWord tokens that look numeric (e.g. "98.6", "19.99")
+                // so they flow through the number handling path in transcribe()
+                if token.tag == .otherWord,
+                    token.text.first?.isNumber == true,
+                    token.text.allSatisfy({ $0.isNumber || $0 == "." || $0 == "," })
+                {
+                    token.tag = .number
                 }
 
                 if token.meta.alias != nil || token.phonemes != nil {
@@ -494,10 +504,16 @@ final class EnglishG2P {
     }
 
     /// Resolve a single word/part through the full fallback chain:
-    /// lexicon → BART → letter spelling → raw text.
+    /// lexicon → letter spelling (for acronyms) → BART → letter spelling → raw text.
     private func resolvePart(_ text: String) -> (String, Int) {
         if let ph = lexicon.phonemesForWord(text) {
             return (ph, 3)
+        }
+
+        // All-uppercase short strings are likely acronyms — spell them out
+        if text.count <= 4, text == text.uppercased(), text.allSatisfy({ $0.isLetter }) {
+            let nnp = lexicon.getNNP(text)
+            if let ph = nnp.0 { return (ph, nnp.1 ?? 2) }
         }
 
         if let result = bart?.predict(text.lowercased()) {
