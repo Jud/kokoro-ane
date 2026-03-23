@@ -17,9 +17,17 @@ struct Kokoro: AsyncParsableCommand {
 // MARK: - Say
 
 struct Say: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
-        abstract: "Synthesize text to speech"
-    )
+    #if ESPEAK_NG
+        static let configuration = CommandConfiguration(
+            abstract: "Synthesize text to speech"
+        )
+    #else
+        static let configuration = CommandConfiguration(
+            abstract: "Synthesize text to speech",
+            discussion:
+                "Note: build with --traits espeak to enable --language for multilingual synthesis via eSpeak-NG."
+        )
+    #endif
 
     @Option(name: [.short, .long], help: "Voice preset")
     var voice: String = "af_heart"
@@ -41,6 +49,11 @@ struct Say: AsyncParsableCommand {
 
     @Flag(name: .long, help: "Input is IPA phonemes (skip G2P)")
     var ipa = false
+
+    #if ESPEAK_NG
+        @Option(name: [.short, .long], help: "Language for eSpeak-NG phonemizer (e.g. es, fr, ja)")
+        var language: String?
+    #endif
 
     @Flag(name: .long, help: "Print debug information")
     var debug = false
@@ -175,6 +188,12 @@ struct Say: AsyncParsableCommand {
     private func loadEngine() throws -> KokoroEngine {
         let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? KokoroEngine.defaultModelDirectory
         try CLIModelDownloader.ensureModels(at: dir)
+        #if ESPEAK_NG
+            if let lang = language {
+                let phonemizer = try EspeakPhonemizer(language: lang)
+                return try KokoroEngine(modelDirectory: dir, phonemizer: phonemizer)
+            }
+        #endif
         return try KokoroEngine(modelDirectory: dir)
     }
 

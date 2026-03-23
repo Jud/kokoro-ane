@@ -93,7 +93,7 @@ public final class KokoroEngine: @unchecked Sendable {
     private static let logger = Logger(
         subsystem: "com.kokorocoreml", category: "KokoroEngine")
 
-    private let g2p: EnglishG2P
+    private let phonemizer: any Phonemizer
     private let g2pLock = NSLock()
     private let synthesizeLock = NSLock()
     private let tokenizer: Tokenizer
@@ -112,12 +112,12 @@ public final class KokoroEngine: @unchecked Sendable {
     /// Returns immediately — models load and warm up in the background.
     /// Synthesis calls block until loading completes. Check ``isReady``
     /// to know when warmup is fully done.
-    public init(modelDirectory: URL) throws {
+    public init(modelDirectory: URL, phonemizer: (any Phonemizer)? = nil) throws {
         guard ModelManager.modelsAvailable(at: modelDirectory) else {
             throw KokoroError.modelsNotAvailable(modelDirectory)
         }
 
-        self.g2p = EnglishG2P(british: false)
+        self.phonemizer = phonemizer ?? EnglishG2P(british: false)
 
         let vocabURL = modelDirectory.appendingPathComponent("vocab_index.json")
         if FileManager.default.fileExists(atPath: vocabURL.path) {
@@ -482,8 +482,7 @@ public final class KokoroEngine: @unchecked Sendable {
     private func lockedPhonemize(_ text: String) -> String {
         g2pLock.lock()
         defer { g2pLock.unlock() }
-        let (phonemes, _) = g2p.phonemize(text: text)
-        return phonemes
+        return phonemizer.phonemize(text)
     }
 
     static func chunkPhonemes(_ phonemes: String, maxPhonemes: Int) -> [String] {
