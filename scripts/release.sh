@@ -93,9 +93,10 @@ fi
 echo ""
 echo "Step 5: Packaging..."
 cd "$EXPORT_DIR"
-# Rename palettized models to the standard names for the release
-cp -r kokoro_frontend_pal8.mlmodelc kokoro_frontend.mlmodelc 2>/dev/null || true
-cp -r kokoro_backend_pal8.mlmodelc kokoro_backend.mlmodelc 2>/dev/null || true
+# Replace float32 models with palettized versions
+rm -rf kokoro_frontend.mlmodelc kokoro_backend.mlmodelc
+mv kokoro_frontend_pal8.mlmodelc kokoro_frontend.mlmodelc
+mv kokoro_backend_pal8.mlmodelc kokoro_backend.mlmodelc
 tar czf "../$TARBALL" \
     kokoro_frontend.mlmodelc \
     kokoro_backend.mlmodelc \
