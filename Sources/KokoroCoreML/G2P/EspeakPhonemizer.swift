@@ -37,7 +37,18 @@
 
             espeak_ng_InitializePath(root.path)
 
+            // Suppress "Can't read dictionary file" warnings from eSpeak init.
+            // These are benign — eSpeak scans for all ~120 language dictionaries
+            // but most aren't compiled from source data. The languages we need
+            // (fr, es, it, pt, hi) are compiled by ensureBundleInstalled above.
+            let savedStderr = dup(STDERR_FILENO)
+            let devNull = open("/dev/null", O_WRONLY)
+            dup2(devNull, STDERR_FILENO)
             let status = espeak_ng_Initialize(nil)
+            dup2(savedStderr, STDERR_FILENO)
+            close(devNull)
+            close(savedStderr)
+
             guard status == ENS_OK else {
                 throw KokoroError.modelLoadFailed(
                     "espeak_ng_Initialize failed with status \(status.rawValue)")
