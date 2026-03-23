@@ -18,6 +18,11 @@ jobs:
         with:
           swift-version: "6.2"
 
+      - name: Stamp version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i '' "s/version: \".*\"/version: \"${VERSION}\"/" Sources/CLI/KokoroSay.swift
+
       - name: Build release binary
         run: swift build -c release --traits espeak
 

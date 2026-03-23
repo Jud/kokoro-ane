@@ -8,7 +8,7 @@ struct Kokoro: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "kokoro",
         abstract: "Kokoro text-to-speech",
-        version: "0.6.0",
+        version: "0.9.0",
         subcommands: [Say.self, Update.self, Daemon.self],
         defaultSubcommand: Say.self
     )
