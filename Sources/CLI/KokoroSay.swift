@@ -106,23 +106,35 @@ struct Say: AsyncParsableCommand {
     }
 
     #if ESPEAK_NG
-        /// eSpeak language code → Kokoro voice prefix → default voice
-        private static let languageVoices:
-            [(lang: String, name: String, prefix: String, defaultVoice: String)] = [
-                ("en", "English", "a", "af_heart"),
-                ("es", "Spanish", "e", "ef_dora"),
-                ("fr", "French", "f", "ff_siwis"),
-                ("hi", "Hindi", "h", "hf_alpha"),
-                ("it", "Italian", "i", "if_sara"),
-                ("ja", "Japanese", "j", "jf_gongitsune"),
-                ("pt", "Portuguese", "p", "pf_dora"),
-                ("cmn", "Mandarin", "z", "zf_xiaoxiao"),
-            ]
+        /// eSpeak language code → display name → default voice
+        private static let languageVoices: [(lang: String, name: String, defaultVoice: String)] = [
+            ("en", "English", "af_heart"),
+            ("es", "Spanish", "ef_dora"),
+            ("fr", "French", "ff_siwis"),
+            ("hi", "Hindi", "hf_alpha"),
+            ("it", "Italian", "if_sara"),
+            ("ja", "Japanese", "jf_gongitsune"),
+            ("pt", "Portuguese", "pf_dora"),
+            ("cmn", "Mandarin", "zf_xiaoxiao"),
+        ]
 
         private func defaultVoice(forLanguage lang: String) -> String? {
             Self.languageVoices.first { $0.lang == lang }?.defaultVoice
         }
     #endif
+
+    /// Resolve the effective voice, applying language-based default if the user
+    /// specified --language but didn't override --voice.
+    private func resolveVoice() -> String {
+        #if ESPEAK_NG
+            if let lang = language, voice == "af_heart",
+                let defaultV = defaultVoice(forLanguage: lang)
+            {
+                return defaultV
+            }
+        #endif
+        return voice
+    }
 
     private func execute() throws {
         // --list-voices needs the engine, handle separately
@@ -144,16 +156,7 @@ struct Say: AsyncParsableCommand {
             }
         #endif
 
-        // Resolve effective voice (may be overridden by --language)
-        var effectiveVoice = voice
-        #if ESPEAK_NG
-            if let lang = language, voice == "af_heart",
-                let defaultV = defaultVoice(forLanguage: lang)
-            {
-                effectiveVoice = defaultV
-            }
-        #endif
-        let voice = effectiveVoice
+        let voice = resolveVoice()
 
         // Resolve text once for both paths
         let inputText = try resolveText()
@@ -248,6 +251,7 @@ struct Say: AsyncParsableCommand {
 
     private func executeStreaming() async throws {
         let engine = try loadEngine()
+        let voice = resolveVoice()
         let inputText = try resolveText()
 
         guard engine.availableVoices.contains(voice) else {
@@ -256,7 +260,7 @@ struct Say: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        try await streamPlayback(engine: engine, text: inputText)
+        try await streamPlayback(engine: engine, text: inputText, voice: voice)
     }
 
     // MARK: - Input
@@ -329,7 +333,7 @@ struct Say: AsyncParsableCommand {
 
     // MARK: - Streaming
 
-    private func streamPlayback(engine: KokoroEngine, text: String) async throws {
+    private func streamPlayback(engine: KokoroEngine, text: String, voice: String) async throws {
         let (audioEngine, player) = try startAudioPlayer()
         defer { audioEngine.stop() }
 
