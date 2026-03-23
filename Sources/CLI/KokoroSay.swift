@@ -236,34 +236,15 @@ struct Say: AsyncParsableCommand {
         let dir = modelDir.map { URL(fileURLWithPath: $0) } ?? KokoroEngine.defaultModelDirectory
         try CLIModelDownloader.ensureModels(at: dir)
         #if ESPEAK_NG
-            // Use eSpeak for all languages when compiled in.
-            // Infer language from voice prefix if --language not explicitly set.
-            let lang = language ?? Self.inferLanguage(fromVoice: voice)
+            // Use eSpeak for phonemization when compiled in.
+            // Default to English unless --language explicitly set.
+            let lang = language ?? "en"
             let phonemizer = try EspeakPhonemizer(language: lang)
             return try KokoroEngine(modelDirectory: dir, phonemizer: phonemizer)
         #else
             return try KokoroEngine(modelDirectory: dir)
         #endif
     }
-
-    #if ESPEAK_NG
-        /// Infer eSpeak language code from Kokoro voice prefix.
-        private static func inferLanguage(fromVoice voice: String) -> String {
-            guard let prefix = voice.first else { return "en" }
-            switch prefix {
-            case "a": return "en"  // American English
-            case "b": return "en"  // British English (accent from voice model)
-            case "e": return "es"  // Spanish
-            case "f": return "fr"  // French
-            case "h": return "hi"  // Hindi
-            case "i": return "it"  // Italian
-            case "j": return "ja"  // Japanese
-            case "p": return "pt"  // Portuguese
-            case "z": return "cmn"  // Mandarin
-            default: return "en"
-            }
-        }
-    #endif
 
     private func executeStreaming() async throws {
         let engine = try loadEngine()
