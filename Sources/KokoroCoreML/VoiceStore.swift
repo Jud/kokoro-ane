@@ -11,12 +11,15 @@ import Foundation
 ///   Header: num_keys (UInt16 LE), dim (UInt16 LE)
 ///   Entries: key_id (UInt16 LE) + dim × Float32 LE values, sorted by key_id
 ///   Key 0 = generic embedding, keys 1–510 = length-indexed.
-final class VoiceStore: Sendable {
+final class VoiceStore: @unchecked Sendable {
     /// Voice name → length-indexed embeddings. Key 0 is the generic fallback.
-    private let voicePacks: [String: VoicePack]
+    private var voicePacks: [String: VoicePack]
 
-    /// Cached sorted voice names (computed once at init).
-    private let sortedVoiceNames: [String]
+    /// Cached sorted voice names (computed once at init, updated on register).
+    private var sortedVoiceNames: [String]
+
+    /// Lock for runtime voice registration.
+    private let registrationLock = NSLock()
 
     /// Style embedding dimension.
     static let styleDim = 256
@@ -55,8 +58,11 @@ final class VoiceStore: Sendable {
     }
 
     private func pack(for voice: String) throws -> VoicePack {
-        guard let pack = voicePacks[voice] else {
-            let available = sortedVoiceNames.prefix(5).joined(separator: ", ")
+        registrationLock.lock()
+        let pack = voicePacks[voice]
+        let available = sortedVoiceNames.prefix(5).joined(separator: ", ")
+        registrationLock.unlock()
+        guard let pack else {
             throw KokoroError.voiceNotFound(
                 "\(voice) — available: \(available)...")
         }
@@ -65,7 +71,31 @@ final class VoiceStore: Sendable {
 
     /// Available voice preset names.
     var availableVoices: [String] {
-        sortedVoiceNames
+        registrationLock.lock()
+        defer { registrationLock.unlock() }
+        return sortedVoiceNames
+    }
+
+    /// All voice names with their generic (key 0) 256-dim embeddings.
+    func allGenericEmbeddings() -> [(name: String, embedding: [Float])] {
+        registrationLock.lock()
+        defer { registrationLock.unlock() }
+        return sortedVoiceNames.compactMap { name in
+            guard let pack = voicePacks[name] else { return nil }
+            return (name: name, embedding: pack.generic)
+        }
+    }
+
+    /// Register a voice at runtime without writing to disk.
+    ///
+    /// The embedding is stored as a generic-only voice (no length-indexed entries).
+    /// Immediately available for synthesis via ``embedding(for:tokenCount:)``.
+    func registerVoice(name: String, embedding: [Float]) {
+        let pack = VoicePack(generic: embedding, indexed: [])
+        registrationLock.lock()
+        voicePacks[name] = pack
+        sortedVoiceNames = voicePacks.keys.sorted()
+        registrationLock.unlock()
     }
 
     // MARK: - Private
