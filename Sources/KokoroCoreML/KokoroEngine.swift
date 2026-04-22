@@ -700,6 +700,15 @@ public final class KokoroEngine: @unchecked Sendable {
         }
 
         var samples = MLArrayHelpers.extractFloats(from: audio, maxCount: validSamples)
+
+        // Drop audio generated for the leading BOS token (token id 0). The model
+        // assigns it real duration frames and synthesizes a short voiced onset —
+        // audible as a schwa before unvoiced fricatives (e.g. "uh-Switch").
+        if let leadingFrames = durations.first, leadingFrames > 0 {
+            let leadSamples = min(leadingFrames * Self.hopSize, samples.count)
+            samples.removeFirst(leadSamples)
+        }
+
         Self.removeTailArtifact(&samples)
         return (samples, durations)
     }
