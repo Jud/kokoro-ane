@@ -74,6 +74,27 @@ public final class KokoroEngine: @unchecked Sendable {
     /// Silence samples inserted between chunks (100ms at 24kHz).
     private static let interChunkSilence = 2400
 
+    /// Minimum audio to keep before the first non-BOS token when trimming BOS output.
+    private static let minLeadingBOSPreroll = 960  // 40ms at 24kHz
+
+    /// Fast-speech floor for adaptive BOS preroll.
+    private static let minFastLeadingBOSPreroll = 720  // 30ms at 24kHz
+
+    /// Maximum audio to keep before the first non-BOS token when trimming BOS output.
+    private static let maxLeadingBOSPreroll = 2040  // 85ms at 24kHz
+
+    /// Fallback BOS preroll when no onset energy is detected.
+    private static let fallbackLeadingBOSPreroll = 1800  // 75ms at 24kHz
+
+    /// Tail of the BOS span scanned for onset energy.
+    private static let leadingBOSSearchWindow = 3000  // 125ms at 24kHz
+
+    /// RMS analysis window for adaptive BOS trimming.
+    private static let leadingBOSAnalysisWindow = 120  // 5ms at 24kHz
+
+    /// Small margin kept before detected onset so fade-in does not eat the transient.
+    private static let leadingBOSOnsetMargin = 120  // 5ms at 24kHz
+
     private enum Feature {
         static let inputIds = "input_ids"
         static let attentionMask = "attention_mask"
@@ -701,16 +722,98 @@ public final class KokoroEngine: @unchecked Sendable {
 
         var samples = MLArrayHelpers.extractFloats(from: audio, maxCount: validSamples)
 
-        // Drop audio generated for the leading BOS token (token id 0). The model
-        // assigns it real duration frames and synthesizes a short voiced onset —
-        // audible as a schwa before unvoiced fricatives (e.g. "uh-Switch").
         if let leadingFrames = durations.first, leadingFrames > 0 {
             let leadSamples = min(leadingFrames * Self.hopSize, samples.count)
-            samples.removeFirst(leadSamples)
+            let trimSamples = Self.adaptiveLeadingBOSTrimSamples(
+                in: samples, leadSamples: leadSamples, speed: speed)
+            if trimSamples > 0 {
+                samples.removeFirst(trimSamples)
+            }
         }
 
         Self.removeTailArtifact(&samples)
         return (samples, durations)
+    }
+
+    /// Choose how much of the leading BOS span to remove without cutting first-phoneme onset.
+    private static func adaptiveLeadingBOSTrimSamples(
+        in samples: [Float], leadSamples: Int, speed: Float
+    ) -> Int {
+        guard leadSamples > 0 else { return 0 }
+
+        let clampedLeadSamples = min(leadSamples, samples.count)
+        let speedScale = 1.0 / max(1.0, speed)
+        let scaledMinPreroll = max(
+            minFastLeadingBOSPreroll,
+            Int((Float(minLeadingBOSPreroll) * speedScale).rounded()))
+        let scaledMaxPreroll = max(
+            scaledMinPreroll,
+            Int((Float(maxLeadingBOSPreroll) * speedScale).rounded()))
+        let scaledFallbackPreroll = min(
+            scaledMaxPreroll,
+            max(scaledMinPreroll, Int((Float(fallbackLeadingBOSPreroll) * speedScale).rounded())))
+
+        let minPreroll = min(scaledMinPreroll, clampedLeadSamples)
+        let maxPreroll = min(scaledMaxPreroll, clampedLeadSamples)
+        let fallbackPreroll = min(scaledFallbackPreroll, clampedLeadSamples)
+        let searchStart = max(0, clampedLeadSamples - leadingBOSSearchWindow)
+        let window = leadingBOSAnalysisWindow
+        guard clampedLeadSamples - searchStart >= window else {
+            return max(0, clampedLeadSamples - fallbackPreroll)
+        }
+
+        var rmsWindows: [(offset: Int, rms: Float)] = []
+        var maxRMS: Float = 0
+        var offset = searchStart
+        while offset + window <= clampedLeadSamples {
+            var sumSquares: Float = 0
+            for i in offset..<(offset + window) {
+                let sample = samples[i]
+                sumSquares += sample * sample
+            }
+            let rms = sqrtf(sumSquares / Float(window))
+            rmsWindows.append((offset, rms))
+            maxRMS = max(maxRMS, rms)
+            offset += window
+        }
+
+        guard maxRMS > 0 else {
+            return max(0, clampedLeadSamples - minPreroll)
+        }
+
+        let baselineCount = min(5, rmsWindows.count)
+        let baselineRMS =
+            rmsWindows.prefix(baselineCount).reduce(Float(0)) { $0 + $1.rms }
+            / Float(baselineCount)
+        let threshold = max(maxRMS * 0.10, baselineRMS * 8.0, Float(0.00002))
+
+        var onsetOffset: Int?
+        for index in rmsWindows.indices {
+            guard rmsWindows[index].rms >= threshold else { continue }
+
+            let lookaheadEnd = min(index + 5, rmsWindows.count)
+            var sustainedWindows = 0
+            for lookahead in index..<lookaheadEnd {
+                if rmsWindows[lookahead].rms >= threshold {
+                    sustainedWindows += 1
+                }
+            }
+
+            if sustainedWindows >= 3 {
+                onsetOffset = rmsWindows[index].offset
+                break
+            }
+        }
+
+        let preroll: Int
+        if let onsetOffset {
+            let detectedPreroll = clampedLeadSamples - onsetOffset + leadingBOSOnsetMargin
+            preroll = min(maxPreroll, max(minPreroll, detectedPreroll))
+        } else {
+            preroll = fallbackPreroll
+        }
+
+        return max(0, clampedLeadSamples - preroll)
     }
 
     /// Remove spurious spike artifacts from the tail of synthesized audio.
