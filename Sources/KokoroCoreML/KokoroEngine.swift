@@ -758,7 +758,6 @@ public final class KokoroEngine: @unchecked Sendable {
         }
 
         var rmsWindows: [(offset: Int, rms: Float)] = []
-        var maxRMS: Float = 0
         var offset = searchStart
         while offset + window <= analysisEnd {
             var sumSquares: Float = 0
@@ -768,19 +767,20 @@ public final class KokoroEngine: @unchecked Sendable {
             }
             let rms = sqrtf(sumSquares / Float(window))
             rmsWindows.append((offset, rms))
-            maxRMS = max(maxRMS, rms)
             offset += window
         }
 
-        guard maxRMS > 0 else {
+        let bosWindows = rmsWindows.filter { $0.offset < clampedLeadSamples }
+        let maxBOSRMS = bosWindows.reduce(Float(0)) { max($0, $1.rms) }
+        guard maxBOSRMS > 0 else {
             return max(0, clampedLeadSamples - fallbackPreroll)
         }
 
-        let baselineCount = min(5, rmsWindows.count)
+        let baselineCount = min(5, bosWindows.count)
         let baselineRMS =
-            rmsWindows.prefix(baselineCount).reduce(Float(0)) { $0 + $1.rms }
+            bosWindows.prefix(baselineCount).reduce(Float(0)) { $0 + $1.rms }
             / Float(baselineCount)
-        let threshold = max(maxRMS * 0.10, baselineRMS * 8.0, Float(0.00002))
+        let threshold = max(maxBOSRMS * 0.10, baselineRMS * 8.0, Float(0.00002))
 
         var onsetOffset: Int?
         for index in rmsWindows.indices {

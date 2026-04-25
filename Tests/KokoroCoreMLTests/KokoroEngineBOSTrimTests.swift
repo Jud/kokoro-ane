@@ -52,4 +52,22 @@ struct KokoroEngineBOSTrimTests {
 
         #expect(trimSamples == leadSamples - 960)
     }
+
+    @Test("Post-BOS peaks do not raise the onset threshold")
+    func postBOSPeaksDoNotRaiseOnsetThreshold() {
+        let leadSamples = 4 * KokoroEngine.hopSize
+        let onsetOffset = leadSamples - 240
+        var samples = [Float](repeating: 0, count: leadSamples + KokoroEngine.hopSize)
+        for index in onsetOffset..<leadSamples {
+            samples[index] = 0.02
+        }
+        for index in leadSamples..<samples.count {
+            samples[index] = 0.5
+        }
+
+        let trimSamples = KokoroEngine.adaptiveLeadingBOSTrimSamples(
+            in: samples, leadSamples: leadSamples, speed: 1.0)
+
+        #expect(trimSamples == leadSamples - 960)
+    }
 }
