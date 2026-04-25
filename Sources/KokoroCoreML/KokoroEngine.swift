@@ -752,14 +752,15 @@ public final class KokoroEngine: @unchecked Sendable {
         let fallbackPreroll = min(leadingBOSOnsetMargin, clampedLeadSamples)
         let searchStart = max(0, clampedLeadSamples - leadingBOSSearchWindow)
         let window = leadingBOSAnalysisWindow
-        guard clampedLeadSamples - searchStart >= window else {
+        let analysisEnd = min(samples.count, clampedLeadSamples + 2 * window)
+        guard analysisEnd - searchStart >= window else {
             return max(0, clampedLeadSamples - fallbackPreroll)
         }
 
         var rmsWindows: [(offset: Int, rms: Float)] = []
         var maxRMS: Float = 0
         var offset = searchStart
-        while offset + window <= clampedLeadSamples {
+        while offset + window <= analysisEnd {
             var sumSquares: Float = 0
             for i in offset..<(offset + window) {
                 let sample = samples[i]
@@ -783,6 +784,7 @@ public final class KokoroEngine: @unchecked Sendable {
 
         var onsetOffset: Int?
         for index in rmsWindows.indices {
+            guard rmsWindows[index].offset < clampedLeadSamples else { break }
             guard rmsWindows[index].rms >= threshold else { continue }
 
             let lookaheadEnd = min(index + 5, rmsWindows.count)

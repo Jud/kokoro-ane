@@ -37,4 +37,19 @@ struct KokoroEngineBOSTrimTests {
 
         #expect(trimSamples == onsetOffset - 120)
     }
+
+    @Test("Boundary-near onset can use post-BOS samples for sustain")
+    func boundaryNearOnsetUsesPostBOSSustain() {
+        let leadSamples = 4 * KokoroEngine.hopSize
+        let onsetOffset = leadSamples - 120
+        var samples = [Float](repeating: 0, count: leadSamples + KokoroEngine.hopSize)
+        for index in onsetOffset..<samples.count {
+            samples[index] = 0.1
+        }
+
+        let trimSamples = KokoroEngine.adaptiveLeadingBOSTrimSamples(
+            in: samples, leadSamples: leadSamples, speed: 1.0)
+
+        #expect(trimSamples == leadSamples - 960)
+    }
 }
