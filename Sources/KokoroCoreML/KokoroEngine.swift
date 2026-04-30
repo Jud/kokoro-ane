@@ -1214,7 +1214,7 @@ public enum TimedSpeakEvent: @unchecked Sendable {
 // MARK: - SynthesisResult
 
 /// Timestamp for a synthesized text token.
-public struct SynthesisTimestamp: Sendable, Equatable {
+public struct SynthesisTimestamp: Sendable, Equatable, Codable {
     /// Original text token.
     public let text: String
 

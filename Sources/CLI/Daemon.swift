@@ -213,11 +213,11 @@ struct Daemon: ParsableCommand {
 
         func run() throws {
             if let pid = readPID(from: DaemonConfig.pidPath), isProcessAlive(pid) {
-                let stop = Stop()
+                let stop = try Stop.parse([])
                 try stop.run()
             }
-            var start = Start()
-            start.modelDir = modelDir
+            let startArgs = modelDir.map { ["--model-dir", $0] } ?? []
+            let start = try Start.parse(startArgs)
             try start.run()
         }
     }
@@ -292,7 +292,8 @@ private func handleClient(fd: Int32, engine: KokoroEngine) {
             sampleCount: result.samples.count,
             synthesisTime: result.synthesisTime,
             phonemes: result.phonemes,
-            tokenCount: result.tokenCount)
+            tokenCount: result.tokenCount,
+            timestamps: result.timestamps)
 
         guard DaemonIO.writeMessage(response, to: fd) else { return }
         _ = LengthPrefixedIO.writeRawSamples(result.samples, to: fd)

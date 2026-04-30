@@ -107,8 +107,9 @@ struct Say: AsyncParsableCommand {
         // Resolve text once for both paths
         let inputText = try resolveText()
 
-        // Try daemon (unless local-only output is requested)
-        if !debug && !ipa && !showText {
+        // Try daemon for text synthesis. It keeps models hot and returns
+        // timestamps for --show-text when the daemon protocol is current.
+        if !debug && !ipa {
             let request = SynthesisRequest(
                 text: inputText, voice: voice, speed: speed)
             switch DaemonClient.synthesize(request) {
@@ -126,7 +127,13 @@ struct Say: AsyncParsableCommand {
                     print("Wrote \(output)")
                 }
                 if play || output == nil {
-                    try playAudio(samples: samples)
+                    let timestamps = response.timestamps ?? []
+                    if showText && timestamps.isEmpty {
+                        fputs("Text timestamps unavailable\n", stderr)
+                    }
+                    try playAudio(
+                        samples: samples,
+                        timestamps: showText ? timestamps : [])
                 }
                 return
             case .daemonError(let message):

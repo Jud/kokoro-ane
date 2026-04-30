@@ -1,5 +1,6 @@
 import CBOR
 import Foundation
+import KokoroCoreML
 
 enum DaemonConfig {
     private static let basePath = "\(NSTemporaryDirectory())kokoro-coreml-\(getuid())"
@@ -7,7 +8,7 @@ enum DaemonConfig {
     static let pidPath = basePath + ".pid"
 
     /// Increment when the wire format changes.
-    static let protocolVersion: Int = 1
+    static let protocolVersion: Int = 2
 }
 
 struct SynthesisRequest: Codable {
@@ -25,6 +26,7 @@ struct SynthesisResponse: Codable {
     var synthesisTime: Double?
     var phonemes: String?
     var tokenCount: Int?
+    var timestamps: [SynthesisTimestamp]?
 }
 
 // MARK: - CBOR I/O
