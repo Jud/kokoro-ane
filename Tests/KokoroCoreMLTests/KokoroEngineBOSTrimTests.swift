@@ -70,4 +70,78 @@ struct KokoroEngineBOSTrimTests {
 
         #expect(trimSamples == leadSamples - 960)
     }
+
+    @Test("EOS fallback preserves minPostroll when no drop is detected")
+    func eosFallbackPreservesMinPostroll() {
+        let trailSamples = 4 * KokoroEngine.hopSize
+        let totalSamples = trailSamples + KokoroEngine.hopSize
+        let uniform = [Float](repeating: 0.01, count: totalSamples)
+        let silent = [Float](repeating: 0, count: totalSamples)
+
+        let uniformTrim = KokoroEngine.adaptiveTrailingEOSTrimSamples(
+            in: uniform, trailSamples: trailSamples, speed: 1.0)
+        let silentTrim = KokoroEngine.adaptiveTrailingEOSTrimSamples(
+            in: silent, trailSamples: trailSamples, speed: 1.0)
+
+        // No drop → fallback minPostroll = 40ms = 960 samples.
+        #expect(uniformTrim == trailSamples - 960)
+        #expect(silentTrim == trailSamples - 960)
+    }
+
+    @Test("EOS detected drop expands postroll up to maxPostroll")
+    func eosDetectedDropAdaptsPostroll() {
+        let trailSamples = 8 * KokoroEngine.hopSize  // 4800 samples (200ms)
+        let totalSamples = trailSamples + KokoroEngine.hopSize
+        let eosStart = totalSamples - trailSamples
+        // Drop boundary at +5 windows (600 samples = 25ms) into EOS.
+        let dropAt = eosStart + 5 * 120
+        var samples = [Float](repeating: 0.01, count: totalSamples)
+        for index in 0..<dropAt {
+            samples[index] = 0.1
+        }
+
+        let trimSamples = KokoroEngine.adaptiveTrailingEOSTrimSamples(
+            in: samples, trailSamples: trailSamples, speed: 1.0)
+
+        // detectedPostroll = (dropAt - eosStart) + 120 margin = 600 + 120 = 720,
+        // clamped to [minPostroll=960, maxPostroll=2040] → 960.
+        #expect(trimSamples == trailSamples - 960)
+    }
+
+    @Test("EOS deep drop selects detected postroll over minimum")
+    func eosDeepDropUsesDetectedPostroll() {
+        let trailSamples = 12 * KokoroEngine.hopSize  // 7200 samples (300ms)
+        let totalSamples = trailSamples + KokoroEngine.hopSize
+        let eosStart = totalSamples - trailSamples
+        // Drop boundary at +10 windows (1200 samples = 50ms) into EOS.
+        let dropAt = eosStart + 10 * 120
+        var samples = [Float](repeating: 0.01, count: totalSamples)
+        for index in 0..<dropAt {
+            samples[index] = 0.1
+        }
+
+        let trimSamples = KokoroEngine.adaptiveTrailingEOSTrimSamples(
+            in: samples, trailSamples: trailSamples, speed: 1.0)
+
+        // detectedPostroll = 1200 + 120 = 1320, between min(960) and max(2040) → 1320.
+        #expect(trimSamples == trailSamples - 1320)
+    }
+
+    @Test("Pre-EOS drops do not trigger boundary detection")
+    func preEOSDropIgnored() {
+        let trailSamples = 4 * KokoroEngine.hopSize
+        let totalSamples = trailSamples + 4 * KokoroEngine.hopSize  // extra speech tail
+        let eosStart = totalSamples - trailSamples
+        // Drop happens entirely BEFORE EOS — should fall back to minPostroll.
+        let dropAt = eosStart - 240
+        var samples = [Float](repeating: 0.01, count: totalSamples)
+        for index in 0..<dropAt {
+            samples[index] = 0.1
+        }
+
+        let trimSamples = KokoroEngine.adaptiveTrailingEOSTrimSamples(
+            in: samples, trailSamples: trailSamples, speed: 1.0)
+
+        #expect(trimSamples == trailSamples - 960)
+    }
 }

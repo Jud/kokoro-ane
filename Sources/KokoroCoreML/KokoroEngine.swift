@@ -110,6 +110,18 @@ public final class KokoroEngine: @unchecked Sendable {
     /// Required windows above threshold within the lookahead to accept an onset.
     private static let leadingBOSOnsetSustainWindows = 3
 
+    /// Minimum audio to keep after the last non-EOS token when trimming EOS output.
+    private static let minTrailingEOSPostroll = 960  // 40ms at 24kHz
+
+    /// Fast-speech floor for adaptive EOS postroll.
+    private static let minFastTrailingEOSPostroll = 720  // 30ms at 24kHz
+
+    /// Maximum audio to keep after the last non-EOS token when trimming EOS output.
+    private static let maxTrailingEOSPostroll = 2040  // 85ms at 24kHz
+
+    /// RMS drop ratio that signals the speech-tail → EOS-schwa transition (≈12 dB).
+    private static let trailingEOSDropRatio: Float = 4.0
+
     private enum Feature {
         static let inputIds = "input_ids"
         static let attentionMask = "attention_mask"
@@ -749,6 +761,20 @@ public final class KokoroEngine: @unchecked Sendable {
             }
         }
 
+        // Mirror the BOS trim on the trailing EOS token. Voice-dependent: some voices
+        // (notably bf_lily) emit a soft trailing schwa that sits ~150ms before the file
+        // end — outside removeTailArtifact's 100ms search window.
+        if durations.count > 1,
+            let trailingFrames = durations.last, trailingFrames > 0
+        {
+            let trailSamples = min(trailingFrames * Self.hopSize, samples.count)
+            let trimSamples = Self.adaptiveTrailingEOSTrimSamples(
+                in: samples, trailSamples: trailSamples, speed: speed)
+            if trimSamples > 0 {
+                samples.removeLast(trimSamples)
+            }
+        }
+
         Self.removeTailArtifact(&samples)
         return (samples, durations)
     }
@@ -840,6 +866,74 @@ public final class KokoroEngine: @unchecked Sendable {
         }
 
         return max(0, clampedLeadSamples - preroll)
+    }
+
+    /// Choose how much of the trailing EOS span to remove without cutting last-phoneme tail.
+    /// Mirrors `adaptiveLeadingBOSTrimSamples`: scans the EOS span for a sharp RMS drop
+    /// (≈12 dB) that marks the speech-tail → schwa transition, then trims from there
+    /// using a clamped postroll budget. Falls back to `minPostroll` when no drop is found
+    /// (uniformly silent EOS, e.g. voices with no audible trailing schwa).
+    static func adaptiveTrailingEOSTrimSamples(
+        in samples: [Float], trailSamples: Int, speed: Float
+    ) -> Int {
+        guard trailSamples > 0 else { return 0 }
+
+        let clampedTrailSamples = min(trailSamples, samples.count)
+        let speedScale = 1.0 / max(1.0, speed)
+        let scaledMinPostroll = max(
+            minFastTrailingEOSPostroll,
+            Int((Float(minTrailingEOSPostroll) * speedScale).rounded()))
+        let scaledMaxPostroll = max(
+            scaledMinPostroll,
+            Int((Float(maxTrailingEOSPostroll) * speedScale).rounded()))
+
+        let minPostroll = min(scaledMinPostroll, clampedTrailSamples)
+        let maxPostroll = min(scaledMaxPostroll, clampedTrailSamples)
+        let eosStart = samples.count - clampedTrailSamples
+        let window = leadingBOSAnalysisWindow
+        // Look back 2 windows before EOS to anchor the drop comparison in real speech tail.
+        let analysisStart = max(0, eosStart - 2 * window)
+
+        guard samples.count - analysisStart >= window else {
+            return max(0, clampedTrailSamples - minPostroll)
+        }
+
+        let windowCapacity = (samples.count - analysisStart) / window
+        var rmsWindows: [(offset: Int, rms: Float)] = []
+        rmsWindows.reserveCapacity(windowCapacity)
+        var offset = analysisStart
+        while offset + window <= samples.count {
+            var sumSquares: Float = 0
+            for i in offset..<(offset + window) {
+                let sample = samples[i]
+                sumSquares += sample * sample
+            }
+            rmsWindows.append((offset, sqrtf(sumSquares / Float(window))))
+            offset += window
+        }
+
+        var boundaryOffset: Int?
+        for index in 1..<rmsWindows.count {
+            let curr = rmsWindows[index]
+            guard curr.offset >= eosStart else { continue }
+            let prev = rmsWindows[index - 1]
+            if prev.rms > leadingBOSNoiseFloorRMS,
+                prev.rms > curr.rms * trailingEOSDropRatio
+            {
+                boundaryOffset = curr.offset
+                break
+            }
+        }
+
+        let postroll: Int
+        if let boundaryOffset {
+            let detectedPostroll = boundaryOffset - eosStart + leadingBOSOnsetMargin
+            postroll = min(maxPostroll, max(minPostroll, detectedPostroll))
+        } else {
+            postroll = minPostroll
+        }
+
+        return max(0, clampedTrailSamples - postroll)
     }
 
     /// Remove spurious spike artifacts from the tail of synthesized audio.
