@@ -110,12 +110,12 @@ public final class KokoroEngine: @unchecked Sendable {
     /// Required windows above threshold within the lookahead to accept an onset.
     private static let leadingBOSOnsetSustainWindows = 3
 
-    /// Minimum audio to keep after the last non-EOS token when trimming EOS output.
-    /// Must cover the 50ms applyFades fade-out so the fade attenuates only EOS audio.
-    private static let minTrailingEOSPostroll = 1200  // 50ms at 24kHz
+    /// Length of the trailing fade-out applied by `applyFades` (50ms at 24kHz).
+    private static let fadeOutSamples = 1200
 
-    /// Fast-speech floor for adaptive EOS postroll. Same fade-coverage requirement.
-    private static let minFastTrailingEOSPostroll = 1200  // 50ms at 24kHz
+    /// Minimum audio to keep after the last non-EOS token when trimming EOS output.
+    /// Must cover `fadeOutSamples` so the fade attenuates only EOS audio.
+    private static let minTrailingEOSPostroll = fadeOutSamples
 
     /// Maximum audio to keep after the last non-EOS token when trimming EOS output.
     private static let maxTrailingEOSPostroll = 2040  // 85ms at 24kHz
@@ -322,7 +322,7 @@ public final class KokoroEngine: @unchecked Sendable {
             var ramp: Float = 0
             var step = 1.0 / Float(fadeIn)
             vDSP_vrampmul(ptr, 1, &ramp, &step, ptr, 1, vDSP_Length(fadeIn))
-            let fadeOut = min(1200, buf.count)
+            let fadeOut = min(fadeOutSamples, buf.count)
             let fadeStart = buf.count - fadeOut
             ramp = 1.0
             step = -1.0 / Float(fadeOut)
@@ -780,6 +780,27 @@ public final class KokoroEngine: @unchecked Sendable {
         return (samples, durations)
     }
 
+    /// Compute per-window RMS over `samples[start..<end]` in non-overlapping `windowSize`
+    /// chunks. Trailing samples that don't fill a full window are dropped.
+    private static func rmsWindows(
+        in samples: [Float], from start: Int, to end: Int, windowSize: Int
+    ) -> [(offset: Int, rms: Float)] {
+        let capacity = max(0, (end - start) / windowSize)
+        var windows: [(offset: Int, rms: Float)] = []
+        windows.reserveCapacity(capacity)
+        var offset = start
+        while offset + windowSize <= end {
+            var sumSquares: Float = 0
+            for i in offset..<(offset + windowSize) {
+                let sample = samples[i]
+                sumSquares += sample * sample
+            }
+            windows.append((offset, sqrtf(sumSquares / Float(windowSize))))
+            offset += windowSize
+        }
+        return windows
+    }
+
     /// Choose how much of the leading BOS span to remove without cutting first-phoneme onset.
     static func adaptiveLeadingBOSTrimSamples(
         in samples: [Float], leadSamples: Int, speed: Float
@@ -807,20 +828,8 @@ public final class KokoroEngine: @unchecked Sendable {
             return max(0, clampedLeadSamples - fallbackPreroll)
         }
 
-        let windowCapacity = (analysisEnd - searchStart) / window
-        var rmsWindows: [(offset: Int, rms: Float)] = []
-        rmsWindows.reserveCapacity(windowCapacity)
-        var offset = searchStart
-        while offset + window <= analysisEnd {
-            var sumSquares: Float = 0
-            for i in offset..<(offset + window) {
-                let sample = samples[i]
-                sumSquares += sample * sample
-            }
-            let rms = sqrtf(sumSquares / Float(window))
-            rmsWindows.append((offset, rms))
-            offset += window
-        }
+        let rmsWindows = Self.rmsWindows(
+            in: samples, from: searchStart, to: analysisEnd, windowSize: window)
 
         var maxBOSRMS: Float = 0
         var baselineSum: Float = 0
@@ -870,10 +879,10 @@ public final class KokoroEngine: @unchecked Sendable {
     }
 
     /// Choose how much of the trailing EOS span to remove without cutting last-phoneme tail.
-    /// Mirrors `adaptiveLeadingBOSTrimSamples`: scans the EOS span for a sharp RMS drop
-    /// (≈12 dB) that marks the speech-tail → schwa transition, then trims from there
-    /// using a clamped postroll budget. Falls back to `minPostroll` when no drop is found
-    /// (uniformly silent EOS, e.g. voices with no audible trailing schwa).
+    /// Scans the EOS span for a sharp RMS drop (≈12 dB) that marks the speech-tail →
+    /// schwa transition, then trims from there using a clamped postroll budget. Falls
+    /// back to `minPostroll` when no drop is found (uniformly silent EOS, e.g. voices
+    /// with no audible trailing schwa).
     static func adaptiveTrailingEOSTrimSamples(
         in samples: [Float], trailSamples: Int, speed: Float
     ) -> Int {
@@ -881,15 +890,10 @@ public final class KokoroEngine: @unchecked Sendable {
 
         let clampedTrailSamples = min(trailSamples, samples.count)
         let speedScale = 1.0 / max(1.0, speed)
-        let scaledMinPostroll = max(
-            minFastTrailingEOSPostroll,
-            Int((Float(minTrailingEOSPostroll) * speedScale).rounded()))
-        let scaledMaxPostroll = max(
-            scaledMinPostroll,
-            Int((Float(maxTrailingEOSPostroll) * speedScale).rounded()))
-
-        let minPostroll = min(scaledMinPostroll, clampedTrailSamples)
-        let maxPostroll = min(scaledMaxPostroll, clampedTrailSamples)
+        let minPostroll = min(minTrailingEOSPostroll, clampedTrailSamples)
+        let maxPostroll = min(
+            max(minPostroll, Int((Float(maxTrailingEOSPostroll) * speedScale).rounded())),
+            clampedTrailSamples)
         let eosStart = samples.count - clampedTrailSamples
         let window = leadingBOSAnalysisWindow
         // Look back 2 windows before EOS to anchor the drop comparison in real speech tail.
@@ -899,19 +903,8 @@ public final class KokoroEngine: @unchecked Sendable {
             return max(0, clampedTrailSamples - minPostroll)
         }
 
-        let windowCapacity = (samples.count - analysisStart) / window
-        var rmsWindows: [(offset: Int, rms: Float)] = []
-        rmsWindows.reserveCapacity(windowCapacity)
-        var offset = analysisStart
-        while offset + window <= samples.count {
-            var sumSquares: Float = 0
-            for i in offset..<(offset + window) {
-                let sample = samples[i]
-                sumSquares += sample * sample
-            }
-            rmsWindows.append((offset, sqrtf(sumSquares / Float(window))))
-            offset += window
-        }
+        let rmsWindows = Self.rmsWindows(
+            in: samples, from: analysisStart, to: samples.count, windowSize: window)
 
         var boundaryOffset: Int?
         for index in 1..<rmsWindows.count {
