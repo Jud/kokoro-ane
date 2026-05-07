@@ -92,6 +92,24 @@ public final class KokoroEngine: @unchecked Sendable {
     /// Small margin kept before detected onset so fade-in does not eat the transient.
     private static let leadingBOSOnsetMargin = 120  // 5ms at 24kHz
 
+    /// Number of windows from the BOS head averaged to estimate the silent baseline.
+    private static let leadingBOSBaselineWindowCount = 5
+
+    /// Onset RMS threshold as a fraction of peak BOS RMS.
+    private static let leadingBOSPeakRMSFraction: Float = 0.10
+
+    /// Onset RMS threshold as a multiple of baseline RMS.
+    private static let leadingBOSBaselineRMSMultiplier: Float = 8.0
+
+    /// Absolute RMS floor below which a window is treated as silence.
+    private static let leadingBOSNoiseFloorRMS: Float = 0.00002
+
+    /// Windows of lookahead used to confirm a candidate onset is sustained.
+    private static let leadingBOSOnsetLookaheadWindows = 5
+
+    /// Required windows above threshold within the lookahead to accept an onset.
+    private static let leadingBOSOnsetSustainWindows = 3
+
     private enum Feature {
         static let inputIds = "input_ids"
         static let attentionMask = "attention_mask"
@@ -719,6 +737,9 @@ public final class KokoroEngine: @unchecked Sendable {
 
         var samples = MLArrayHelpers.extractFloats(from: audio, maxCount: validSamples)
 
+        // Drop audio generated for the leading BOS token (token id 0). The model
+        // assigns it real duration frames and synthesizes a short voiced onset —
+        // audible as a schwa before unvoiced fricatives (e.g. "uh-Switch").
         if let leadingFrames = durations.first, leadingFrames > 0 {
             let leadSamples = min(leadingFrames * Self.hopSize, samples.count)
             let trimSamples = Self.adaptiveLeadingBOSTrimSamples(
@@ -752,12 +773,16 @@ public final class KokoroEngine: @unchecked Sendable {
         let fallbackPreroll = min(leadingBOSOnsetMargin, clampedLeadSamples)
         let searchStart = max(0, clampedLeadSamples - leadingBOSSearchWindow)
         let window = leadingBOSAnalysisWindow
+        // Extend past the BOS boundary so an onset right at the boundary still has
+        // enough lookahead samples to confirm sustain.
         let analysisEnd = min(samples.count, clampedLeadSamples + 2 * window)
         guard analysisEnd - searchStart >= window else {
             return max(0, clampedLeadSamples - fallbackPreroll)
         }
 
+        let windowCapacity = (analysisEnd - searchStart) / window
         var rmsWindows: [(offset: Int, rms: Float)] = []
+        rmsWindows.reserveCapacity(windowCapacity)
         var offset = searchStart
         while offset + window <= analysisEnd {
             var sumSquares: Float = 0
@@ -770,32 +795,37 @@ public final class KokoroEngine: @unchecked Sendable {
             offset += window
         }
 
-        let bosWindows = rmsWindows.filter { $0.offset < clampedLeadSamples }
-        let maxBOSRMS = bosWindows.reduce(Float(0)) { max($0, $1.rms) }
-        guard maxBOSRMS > 0 else {
+        var maxBOSRMS: Float = 0
+        var baselineSum: Float = 0
+        var baselineCount = 0
+        for entry in rmsWindows {
+            guard entry.offset < clampedLeadSamples else { break }
+            if entry.rms > maxBOSRMS { maxBOSRMS = entry.rms }
+            if baselineCount < leadingBOSBaselineWindowCount {
+                baselineSum += entry.rms
+                baselineCount += 1
+            }
+        }
+        guard maxBOSRMS > 0, baselineCount > 0 else {
             return max(0, clampedLeadSamples - fallbackPreroll)
         }
 
-        let baselineCount = min(5, bosWindows.count)
-        let baselineRMS =
-            bosWindows.prefix(baselineCount).reduce(Float(0)) { $0 + $1.rms }
-            / Float(baselineCount)
-        let threshold = max(maxBOSRMS * 0.10, baselineRMS * 8.0, Float(0.00002))
+        let baselineRMS = baselineSum / Float(baselineCount)
+        let threshold = max(
+            maxBOSRMS * leadingBOSPeakRMSFraction,
+            baselineRMS * leadingBOSBaselineRMSMultiplier,
+            leadingBOSNoiseFloorRMS)
 
         var onsetOffset: Int?
         for index in rmsWindows.indices {
             guard rmsWindows[index].offset < clampedLeadSamples else { break }
             guard rmsWindows[index].rms >= threshold else { continue }
 
-            let lookaheadEnd = min(index + 5, rmsWindows.count)
-            var sustainedWindows = 0
-            for lookahead in index..<lookaheadEnd {
-                if rmsWindows[lookahead].rms >= threshold {
-                    sustainedWindows += 1
-                }
-            }
+            let lookaheadEnd = min(index + leadingBOSOnsetLookaheadWindows, rmsWindows.count)
+            let sustainedWindows = rmsWindows[index..<lookaheadEnd]
+                .count(where: { $0.rms >= threshold })
 
-            if sustainedWindows >= 3 {
+            if sustainedWindows >= leadingBOSOnsetSustainWindows {
                 onsetOffset = rmsWindows[index].offset
                 break
             }
