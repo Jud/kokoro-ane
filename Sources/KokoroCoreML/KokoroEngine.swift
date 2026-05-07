@@ -111,10 +111,11 @@ public final class KokoroEngine: @unchecked Sendable {
     private static let leadingBOSOnsetSustainWindows = 3
 
     /// Minimum audio to keep after the last non-EOS token when trimming EOS output.
-    private static let minTrailingEOSPostroll = 960  // 40ms at 24kHz
+    /// Must cover the 50ms applyFades fade-out so the fade attenuates only EOS audio.
+    private static let minTrailingEOSPostroll = 1200  // 50ms at 24kHz
 
-    /// Fast-speech floor for adaptive EOS postroll.
-    private static let minFastTrailingEOSPostroll = 720  // 30ms at 24kHz
+    /// Fast-speech floor for adaptive EOS postroll. Same fade-coverage requirement.
+    private static let minFastTrailingEOSPostroll = 1200  // 50ms at 24kHz
 
     /// Maximum audio to keep after the last non-EOS token when trimming EOS output.
     private static let maxTrailingEOSPostroll = 2040  // 85ms at 24kHz
