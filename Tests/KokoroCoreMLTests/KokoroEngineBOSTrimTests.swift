@@ -103,8 +103,8 @@ struct KokoroEngineBOSTrimTests {
         let trimSamples = KokoroEngine.adaptiveTrailingEOSTrimSamples(
             in: samples, trailSamples: trailSamples, speed: 1.0)
 
-        // detectedPostroll = (dropAt - eosStart) + 120 margin = 600 + 120 = 720,
-        // clamped to [minPostroll=960, maxPostroll=2040] → 960.
+        // detectedPostroll = (dropAt - eosStart) + 120 margin = 600 + 120 = 720;
+        // max(minPostroll=960, 720) wins → postroll = 960.
         #expect(trimSamples == trailSamples - 960)
     }
 
