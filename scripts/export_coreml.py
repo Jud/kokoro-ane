@@ -382,7 +382,6 @@ class CoreMLPackedBidirLSTM(nn.Module):
         copy(self.rev, "_reverse")
 
     def forward(self, x, lengths, pad_mask):
-        # x: [B, T, C], lengths: [B] long, pad_mask: [B, T] bool (True = padded)
         valid = (~pad_mask).to(x.dtype).unsqueeze(-1)
         x = x * valid
 
@@ -411,7 +410,6 @@ class CoreMLTextEncoder(nn.Module):
         self.lstm = CoreMLPackedBidirLSTM(src.lstm)
 
     def forward(self, x, input_lengths, m):
-        # m: [B, T] bool, True = padded position.
         x = self.embedding(x)
         x = x.transpose(1, 2)
         m1 = m.unsqueeze(1)
@@ -444,7 +442,6 @@ class CoreMLDurationEncoder(nn.Module):
         self.sty_dim = src.sty_dim
 
     def forward(self, x, style, text_lengths, m):
-        # m: [B, T] bool, True = padded.
         masks = m
         x = x.permute(2, 0, 1)
         s = style.expand(x.shape[0], x.shape[1], -1)

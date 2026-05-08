@@ -67,7 +67,6 @@ def run_coreml(fe, token_ids, total_n, ref_s):
 
 
 def tokenize(text, pipeline):
-    """Convert text → token id sequence using the pipeline's G2P + vocab."""
     _, tokens = pipeline.g2p(text)
     phonemes = "".join(t.phonemes or "" for t in tokens)
     ids = [pipeline.model.vocab[c] for c in phonemes if c in pipeline.model.vocab]
