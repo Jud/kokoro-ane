@@ -70,7 +70,7 @@ final class AudioEngine {
             let stream = try engine.speak(text, voice: voice, speed: speed)
             var firstBuffer = true
             for await event in stream {
-                if Task.isCancelled { break }
+                if Task.isCancelled || self.playerNode !== player { break }
                 switch event {
                 case .audio(let buffer):
                     if firstBuffer {
@@ -84,16 +84,14 @@ final class AudioEngine {
             }
         } catch {
             self.error = "Synthesis failed: \(error.localizedDescription)"
-            teardown()
+            self.isSynthesizing = false
+            if self.playerNode === player { teardown() }
             return
         }
 
         self.isSynthesizing = false
 
-        if Task.isCancelled {
-            teardown()
-            return
-        }
+        if Task.isCancelled || self.playerNode !== player { return }
 
         scheduleEndSentinel(on: player)
     }
@@ -111,9 +109,8 @@ final class AudioEngine {
 
         let analyzer = self.spectrumAnalyzer
         let monitor = self.levelMonitor
-        let tapFormat = avEngine.mainMixerNode.outputFormat(forBus: 0)
-        avEngine.mainMixerNode.installTap(
-            onBus: 0, bufferSize: 1024, format: tapFormat
+        player.installTap(
+            onBus: 0, bufferSize: 1024, format: KokoroEngine.audioFormat
         ) { buffer, _ in
             let bands = analyzer.analyze(buffer)
             monitor?.pushBands(bands)
@@ -133,7 +130,7 @@ final class AudioEngine {
             let sentinel = AVAudioPCMBuffer(
                 pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)
         else {
-            teardown()
+            if self.playerNode === player { teardown() }
             return
         }
         sentinel.frameLength = 1
@@ -141,13 +138,16 @@ final class AudioEngine {
         player.scheduleBuffer(
             sentinel, at: nil, options: [], completionCallbackType: .dataPlayedBack
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.teardown() }
+            Task { @MainActor in
+                guard let self, self.playerNode === player else { return }
+                self.teardown()
+            }
         }
     }
 
     private func teardown() {
+        playerNode?.removeTap(onBus: 0)
         playerNode?.stop()
-        avEngine?.mainMixerNode.removeTap(onBus: 0)
         avEngine?.stop()
         avEngine = nil
         playerNode = nil
