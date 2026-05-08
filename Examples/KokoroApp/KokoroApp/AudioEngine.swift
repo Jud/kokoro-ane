@@ -4,7 +4,7 @@ import Observation
 
 @Observable
 @MainActor
-final class AudioEngine: NSObject, AVAudioPlayerDelegate {
+final class AudioEngine {
     var isPlaying = false
     var isSynthesizing = false
     var availableVoices: [String] = []
@@ -13,8 +13,9 @@ final class AudioEngine: NSObject, AVAudioPlayerDelegate {
     var levelMonitor: AudioLevelMonitor?
 
     private var engine: KokoroEngine?
-    private var player: AVAudioPlayer?
-    private var animationTask: Task<Void, Never>?
+    private var avEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var streamTask: Task<Void, Never>?
     private var _analyzer: SpectrumAnalyzer?
     private var spectrumAnalyzer: SpectrumAnalyzer {
         if let a = _analyzer { return a }
@@ -41,128 +42,116 @@ final class AudioEngine: NSObject, AVAudioPlayerDelegate {
         isSynthesizing = true
         error = nil
 
-        let thread = Thread { [weak self] in
-            do {
-                let result = try engine.synthesize(text: text, voice: voice, speed: speed)
-                let wavData = Self.wavData(from: result.samples, sampleRate: KokoroEngine.sampleRate)
-
-                Task { @MainActor in
-                    guard let self, self.isSynthesizing else { return }
-                    self.isSynthesizing = false
-                    self.isPlaying = true
-                    self.playWAV(wavData, samples: result.samples)
-                }
-            } catch {
-                Task { @MainActor in
-                    self?.error = "Synthesis failed: \(error.localizedDescription)"
-                    self?.isSynthesizing = false
-                    self?.isPlaying = false
-                }
-            }
+        streamTask = Task { [weak self] in
+            await self?.run(engine: engine, text: text, voice: voice, speed: speed)
         }
-        thread.stackSize = 8 * 1024 * 1024
-        thread.start()
     }
 
     func stop() {
-        player?.stop()
+        streamTask?.cancel()
+        streamTask = nil
         teardown()
         isSynthesizing = false
     }
 
-    // MARK: - AVAudioPlayerDelegate
-
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in self.teardown() }
-    }
-
     // MARK: - Private
 
+    private func run(engine: KokoroEngine, text: String, voice: String, speed: Float) async {
+        let player: AVAudioPlayerNode
+        do {
+            player = try startPlayback()
+        } catch {
+            self.error = "Playback setup failed: \(error.localizedDescription)"
+            self.isSynthesizing = false
+            return
+        }
+
+        do {
+            let stream = try engine.speak(text, voice: voice, speed: speed)
+            var firstBuffer = true
+            for await event in stream {
+                if Task.isCancelled { break }
+                switch event {
+                case .audio(let buffer):
+                    if firstBuffer {
+                        firstBuffer = false
+                        self.isPlaying = true
+                    }
+                    player.scheduleBuffer(buffer, completionHandler: nil)
+                case .chunkFailed(let err):
+                    self.error = "Chunk failed: \(err.localizedDescription)"
+                }
+            }
+        } catch {
+            self.error = "Synthesis failed: \(error.localizedDescription)"
+            teardown()
+            return
+        }
+
+        self.isSynthesizing = false
+
+        if Task.isCancelled {
+            teardown()
+            return
+        }
+
+        scheduleEndSentinel(on: player)
+    }
+
+    private func startPlayback() throws -> AVAudioPlayerNode {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default)
+        try session.setActive(true)
+
+        let avEngine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        avEngine.attach(player)
+        avEngine.connect(
+            player, to: avEngine.mainMixerNode, format: KokoroEngine.audioFormat)
+
+        let analyzer = self.spectrumAnalyzer
+        let monitor = self.levelMonitor
+        let tapFormat = avEngine.mainMixerNode.outputFormat(forBus: 0)
+        avEngine.mainMixerNode.installTap(
+            onBus: 0, bufferSize: 1024, format: tapFormat
+        ) { buffer, _ in
+            let bands = analyzer.analyze(buffer)
+            monitor?.pushBands(bands)
+        }
+
+        avEngine.prepare()
+        try avEngine.start()
+        player.play()
+
+        self.avEngine = avEngine
+        self.playerNode = player
+        return player
+    }
+
+    private func scheduleEndSentinel(on player: AVAudioPlayerNode) {
+        guard
+            let sentinel = AVAudioPCMBuffer(
+                pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)
+        else {
+            teardown()
+            return
+        }
+        sentinel.frameLength = 1
+        sentinel.floatChannelData?[0].pointee = 0
+        player.scheduleBuffer(
+            sentinel, at: nil, options: [], completionCallbackType: .dataPlayedBack
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.teardown() }
+        }
+    }
+
     private func teardown() {
-        animationTask?.cancel()
-        animationTask = nil
-        player = nil
+        playerNode?.stop()
+        avEngine?.mainMixerNode.removeTap(onBus: 0)
+        avEngine?.stop()
+        avEngine = nil
+        playerNode = nil
         isPlaying = false
         levelMonitor?.reset()
-    }
-
-    private func playWAV(_ data: Data, samples: [Float]) {
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default)
-            try session.setActive(true)
-
-            let audioPlayer = try AVAudioPlayer(data: data)
-            audioPlayer.delegate = self
-            audioPlayer.prepareToPlay()
-            audioPlayer.play()
-            self.player = audioPlayer
-
-            animateWaveform(samples: samples, duration: audioPlayer.duration)
-        } catch {
-            self.error = "Playback failed: \(error.localizedDescription)"
-            isPlaying = false
-        }
-    }
-
-    private func animateWaveform(samples: [Float], duration: Double) {
-        let analyzer = spectrumAnalyzer
-
-        animationTask?.cancel()
-        animationTask = Task { @MainActor [weak self] in
-            let sampleRate = Double(KokoroEngine.sampleRate)
-            let startTime = CFAbsoluteTimeGetCurrent()
-
-            while let self, self.isPlaying, !Task.isCancelled {
-                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-                if elapsed >= duration + 0.2 { break }
-
-                let sampleIndex = Int(elapsed * sampleRate)
-                if sampleIndex < samples.count {
-                    let bands = analyzer.analyze(samples: samples, offset: sampleIndex)
-                    self.levelMonitor?.pushBands(bands)
-                }
-
-                try? await Task.sleep(for: .milliseconds(33))
-            }
-        }
-    }
-
-    /// Encode Float samples as a 16-bit PCM WAV in memory.
-    private static func wavData(from samples: [Float], sampleRate: Int) -> Data {
-        let numSamples = samples.count
-        let dataSize = numSamples * 2
-        let fileSize = 44 + dataSize
-
-        var data = Data(capacity: fileSize)
-
-        func appendLE<T: FixedWidthInteger>(_ value: T) {
-            var v = value.littleEndian
-            withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
-        }
-
-        data.append(contentsOf: [0x52, 0x49, 0x46, 0x46])  // "RIFF"
-        appendLE(UInt32(fileSize - 8))
-        data.append(contentsOf: [0x57, 0x41, 0x56, 0x45])  // "WAVE"
-        data.append(contentsOf: [0x66, 0x6D, 0x74, 0x20])  // "fmt "
-        appendLE(UInt32(16))
-        appendLE(UInt16(1))  // PCM
-        appendLE(UInt16(1))  // mono
-        appendLE(UInt32(sampleRate))
-        appendLE(UInt32(sampleRate * 2))
-        appendLE(UInt16(2))  // block align
-        appendLE(UInt16(16))  // bits per sample
-        data.append(contentsOf: [0x64, 0x61, 0x74, 0x61])  // "data"
-        appendLE(UInt32(dataSize))
-
-        // Bulk convert float samples to Int16
-        var int16Samples = [Int16](repeating: 0, count: numSamples)
-        for i in 0..<numSamples {
-            let clamped = max(-1.0, min(1.0, samples[i]))
-            int16Samples[i] = Int16(clamped * 32767)
-        }
-        int16Samples.withUnsafeBytes { data.append(contentsOf: $0) }
-
-        return data
     }
 }
