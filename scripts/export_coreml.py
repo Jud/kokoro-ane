@@ -387,15 +387,24 @@ class CoreMLPackedBidirLSTM(nn.Module):
 
         y_f, _ = self.fwd(x)
 
+        # Length-aware reverse via permutation-matrix matmul.
+        # gather_along_axis on dynamic shapes loses output shape info in
+        # coremltools (becomes `tensor<fp32, [?, ?, ?]>`) which prevents the
+        # downstream LSTM from compiling (model-load error -14). matmul
+        # carries shape forward cleanly. The permutation matrix selects
+        # x[rev_idx[i]] for each output position i, where rev_idx flips only
+        # the valid prefix (positions 0..L-1) and leaves pads in place. The
+        # same permutation undoes itself, so we use it for both directions.
         b, t, c = x.shape
         idx = torch.arange(t, device=x.device, dtype=lengths.dtype).unsqueeze(0).expand(b, t)
         l = lengths.unsqueeze(1)
-        rev_idx = torch.where(idx < l, l - 1 - idx, idx).to(torch.long)
+        rev_idx = torch.where(idx < l, l - 1 - idx, idx)
+        positions = torch.arange(t, device=x.device, dtype=rev_idx.dtype).unsqueeze(0)
+        perm = (positions.unsqueeze(0) == rev_idx.unsqueeze(-1)).to(x.dtype)
 
-        x_rev = torch.gather(x, 1, rev_idx.unsqueeze(-1).expand(b, t, c))
+        x_rev = torch.matmul(perm, x)
         y_rev_seq, _ = self.rev(x_rev)
-        y_r = torch.gather(
-            y_rev_seq, 1, rev_idx.unsqueeze(-1).expand(b, t, self.hidden_size))
+        y_r = torch.matmul(perm, y_rev_seq)
 
         return torch.cat([y_f, y_r], dim=-1) * valid
 
@@ -478,15 +487,15 @@ class KokoroModelA(nn.Module):
 
         self.bert = model.bert
         self.bert_encoder = model.bert_encoder
-        # Length-aware substitutes for the bidir LSTM sites in StyleTTS2.
-        # See CoreMLPackedBidirLSTM block comment for the export-pipeline
-        # rationale. Holding only the predictor sub-modules we still call
-        # avoids double-registering the original predictor.text_encoder /
-        # predictor.lstm weights in the traced state_dict.
+        # Hold the whole predictor so jit registers all its sub-modules
+        # (predictor.shared / .F0 / .N / .F0_proj / .N_proj are reached via
+        # self.predictor.F0Ntrain in forward). The text_encoder and lstm
+        # inside model.predictor are bypassed at runtime by the CoreML*
+        # wrappers below — their weights are double-registered in state_dict
+        # but never traced.
+        self.predictor = model.predictor
         self.predictor_text_encoder = CoreMLDurationEncoder(model.predictor.text_encoder)
         self.predictor_duration_lstm = CoreMLPackedBidirLSTM(model.predictor.lstm)
-        self.predictor_duration_proj = model.predictor.duration_proj
-        self.predictor_F0Ntrain = model.predictor.F0Ntrain
         self.text_encoder = CoreMLTextEncoder(model.text_encoder)
         self.gen_frontend = GeneratorFrontEnd(model.decoder.generator)
 
@@ -518,7 +527,7 @@ class KokoroModelA(nn.Module):
 
         d = self.predictor_text_encoder(d_en, s, input_lengths, text_mask)
         x = self.predictor_duration_lstm(d, input_lengths, text_mask)
-        duration = self.predictor_duration_proj(x)
+        duration = self.predictor.duration_proj(x)
         duration = torch.sigmoid(duration).sum(dim=-1) / speed[0]
         pred_dur = torch.round(duration).clamp(min=1).long()
         pred_dur = pred_dur * attention_mask.long()
@@ -536,7 +545,7 @@ class KokoroModelA(nn.Module):
         ).float()
 
         en = d.transpose(-1, -2) @ pred_aln_trg
-        F0_pred, N_pred = self.predictor_F0Ntrain(en, s)
+        F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
 
         t_en = self.text_encoder(input_ids, input_lengths, text_mask)
         asr = t_en @ pred_aln_trg
