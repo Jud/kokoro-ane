@@ -22,7 +22,9 @@ import torch
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from export_coreml import KokoroModelA, NUM_HARMONICS, load_kokoro_model  # noqa: E402
+from export_coreml import (  # noqa: E402
+    KokoroModelA, NUM_HARMONICS, _tokenize, load_kokoro_model,
+)
 from reference import (  # noqa: E402
     patch_pack_padded_sequence, patch_sinegen_for_export,
 )
@@ -66,13 +68,6 @@ def run_coreml(fe, token_ids, total_n, ref_s):
     return out["pred_dur_clamped"].flatten()
 
 
-def tokenize(text, pipeline):
-    _, tokens = pipeline.g2p(text)
-    phonemes = "".join(t.phonemes or "" for t in tokens)
-    ids = [pipeline.model.vocab[c] for c in phonemes if c in pipeline.model.vocab]
-    return [0] + ids + [0]
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--coreml", action="store_true")
@@ -102,7 +97,7 @@ def main():
     voice = pipeline.load_voice(args.voice)
 
     for text in args.texts:
-        token_ids = tokenize(text, pipeline)
+        token_ids = _tokenize(text, pipeline)
         real_n = len(token_ids)
         # Match pipeline.py: pack[len(ps)-1] where ps is the phoneme string
         # (token_ids minus the BOS/EOS bracketing). real_n = len(ps) + 2.

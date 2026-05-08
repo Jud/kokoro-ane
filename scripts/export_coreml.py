@@ -430,7 +430,6 @@ class CoreMLDurationEncoder(nn.Module):
     def __init__(self, src):
         super().__init__()
         from kokoro.modules import AdaLayerNorm
-        self.AdaLayerNorm = AdaLayerNorm
         self.lstms = nn.ModuleList()
         for block in src.lstms:
             if isinstance(block, AdaLayerNorm):
@@ -442,6 +441,7 @@ class CoreMLDurationEncoder(nn.Module):
         self.sty_dim = src.sty_dim
 
     def forward(self, x, style, text_lengths, m):
+        from kokoro.modules import AdaLayerNorm
         masks = m
         x = x.permute(2, 0, 1)
         s = style.expand(x.shape[0], x.shape[1], -1)
@@ -450,7 +450,7 @@ class CoreMLDurationEncoder(nn.Module):
         x = x.transpose(0, 1)
         x = x.transpose(-1, -2)
         for block in self.lstms:
-            if isinstance(block, self.AdaLayerNorm):
+            if isinstance(block, AdaLayerNorm):
                 x = block(x.transpose(-1, -2), style).transpose(-1, -2)
                 x = torch.cat([x, s.permute(1, 2, 0)], axis=1)
                 x = x.masked_fill(masks.unsqueeze(-1).transpose(-1, -2), 0.0)
@@ -478,9 +478,15 @@ class KokoroModelA(nn.Module):
 
         self.bert = model.bert
         self.bert_encoder = model.bert_encoder
-        self.predictor = model.predictor
+        # Length-aware substitutes for the bidir LSTM sites in StyleTTS2.
+        # See CoreMLPackedBidirLSTM block comment for the export-pipeline
+        # rationale. Holding only the predictor sub-modules we still call
+        # avoids double-registering the original predictor.text_encoder /
+        # predictor.lstm weights in the traced state_dict.
         self.predictor_text_encoder = CoreMLDurationEncoder(model.predictor.text_encoder)
         self.predictor_duration_lstm = CoreMLPackedBidirLSTM(model.predictor.lstm)
+        self.predictor_duration_proj = model.predictor.duration_proj
+        self.predictor_F0Ntrain = model.predictor.F0Ntrain
         self.text_encoder = CoreMLTextEncoder(model.text_encoder)
         self.gen_frontend = GeneratorFrontEnd(model.decoder.generator)
 
@@ -512,7 +518,7 @@ class KokoroModelA(nn.Module):
 
         d = self.predictor_text_encoder(d_en, s, input_lengths, text_mask)
         x = self.predictor_duration_lstm(d, input_lengths, text_mask)
-        duration = self.predictor.duration_proj(x)
+        duration = self.predictor_duration_proj(x)
         duration = torch.sigmoid(duration).sum(dim=-1) / speed[0]
         pred_dur = torch.round(duration).clamp(min=1).long()
         pred_dur = pred_dur * attention_mask.long()
@@ -530,7 +536,7 @@ class KokoroModelA(nn.Module):
         ).float()
 
         en = d.transpose(-1, -2) @ pred_aln_trg
-        F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
+        F0_pred, N_pred = self.predictor_F0Ntrain(en, s)
 
         t_en = self.text_encoder(input_ids, input_lengths, text_mask)
         asr = t_en @ pred_aln_trg
