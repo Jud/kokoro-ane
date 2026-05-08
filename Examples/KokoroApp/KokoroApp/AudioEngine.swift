@@ -80,22 +80,11 @@ final class AudioEngine {
             return
         }
 
+        let stream: AsyncStream<SpeakEvent>
         do {
-            let stream = try engine.speak(text, voice: voice, speed: speed)
-            var firstBuffer = true
-            for await event in stream {
-                if !current() { break }
-                switch event {
-                case .audio(let buffer):
-                    if firstBuffer {
-                        firstBuffer = false
-                        self.isPlaying = true
-                    }
-                    player.scheduleBuffer(buffer, completionHandler: nil)
-                case .chunkFailed(let err):
-                    self.error = "Chunk failed: \(err.localizedDescription)"
-                }
-            }
+            stream = try await Task.detached(priority: .userInitiated) {
+                try engine.speak(text, voice: voice, speed: speed)
+            }.value
         } catch {
             if current() {
                 self.error = "Synthesis failed: \(error.localizedDescription)"
@@ -103,6 +92,22 @@ final class AudioEngine {
                 teardown()
             }
             return
+        }
+
+        var firstBuffer = true
+        for await event in stream {
+            if !current() { break }
+            switch event {
+            case .audio(let buffer):
+                if firstBuffer {
+                    firstBuffer = false
+                    self.isSynthesizing = false
+                    self.isPlaying = true
+                }
+                player.scheduleBuffer(buffer, completionHandler: nil)
+            case .chunkFailed(let err):
+                self.error = "Chunk failed: \(err.localizedDescription)"
+            }
         }
 
         if !current() { return }
