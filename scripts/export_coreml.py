@@ -343,6 +343,129 @@ def load_kokoro_model():
 
 
 # ---------------------------------------------------------------------------
+# CoreML-friendly length-aware bidirectional LSTM
+# ---------------------------------------------------------------------------
+# StyleTTS2's text encoder, duration encoder, and prosody predictor all use
+# pack_padded_sequence around bidirectional LSTMs. CoreML cannot convert
+# pack_padded_sequence, so the export historically patched it to a no-op
+# (reference.patch_pack_padded_sequence). That removed length-awareness — the
+# reverse direction of every bidir LSTM consumed pad tokens before reaching the
+# real prefix, contaminating real-token hidden states. Symptom: short utterances
+# get distorted durations.
+#
+# CoreMLPackedBidirLSTM splits a bidir LSTM into two unidirectional LSTMs and
+# reverses only the valid prefix using arange + where + gather — all static ops
+# that survive jit.trace + coremltools convert. Math is equivalent to the
+# original packed bidir LSTM under right-padding (our case).
+class CoreMLPackedBidirLSTM(nn.Module):
+    def __init__(self, src):
+        super().__init__()
+        if not (src.bidirectional and src.num_layers == 1 and src.batch_first):
+            raise ValueError(
+                "CoreMLPackedBidirLSTM expects a 1-layer bidirectional batch_first LSTM")
+        self.hidden_size = src.hidden_size
+        self.fwd = nn.LSTM(
+            src.input_size, src.hidden_size, 1,
+            batch_first=True, bias=src.bias)
+        self.rev = nn.LSTM(
+            src.input_size, src.hidden_size, 1,
+            batch_first=True, bias=src.bias)
+
+        def copy(dst, suffix):
+            for name in ("weight_ih_l0", "weight_hh_l0"):
+                getattr(dst, name).data.copy_(getattr(src, name + suffix).data)
+            if src.bias:
+                for name in ("bias_ih_l0", "bias_hh_l0"):
+                    getattr(dst, name).data.copy_(getattr(src, name + suffix).data)
+
+        copy(self.fwd, "")
+        copy(self.rev, "_reverse")
+
+    def forward(self, x, lengths, pad_mask):
+        # x: [B, T, C], lengths: [B] long, pad_mask: [B, T] bool (True = padded)
+        valid = (~pad_mask).to(x.dtype).unsqueeze(-1)
+        x = x * valid
+
+        y_f, _ = self.fwd(x)
+
+        b, t, c = x.shape
+        idx = torch.arange(t, device=x.device, dtype=lengths.dtype).unsqueeze(0).expand(b, t)
+        l = lengths.unsqueeze(1)
+        rev_idx = torch.where(idx < l, l - 1 - idx, idx).to(torch.long)
+
+        x_rev = torch.gather(x, 1, rev_idx.unsqueeze(-1).expand(b, t, c))
+        y_rev_seq, _ = self.rev(x_rev)
+        y_r = torch.gather(
+            y_rev_seq, 1, rev_idx.unsqueeze(-1).expand(b, t, self.hidden_size))
+
+        return torch.cat([y_f, y_r], dim=-1) * valid
+
+
+class CoreMLTextEncoder(nn.Module):
+    """Length-aware replacement for kokoro.modules.TextEncoder."""
+
+    def __init__(self, src):
+        super().__init__()
+        self.embedding = src.embedding
+        self.cnn = src.cnn
+        self.lstm = CoreMLPackedBidirLSTM(src.lstm)
+
+    def forward(self, x, input_lengths, m):
+        # m: [B, T] bool, True = padded position.
+        x = self.embedding(x)
+        x = x.transpose(1, 2)
+        m1 = m.unsqueeze(1)
+        x = x.masked_fill(m1, 0.0)
+        for c in self.cnn:
+            x = c(x)
+            x = x.masked_fill(m1, 0.0)
+        x = x.transpose(1, 2)
+        x = self.lstm(x, input_lengths, m)
+        x = x.transpose(-1, -2)
+        x = x.masked_fill(m1, 0.0)
+        return x
+
+
+class CoreMLDurationEncoder(nn.Module):
+    """Length-aware replacement for kokoro.modules.DurationEncoder."""
+
+    def __init__(self, src):
+        super().__init__()
+        from kokoro.modules import AdaLayerNorm
+        self.AdaLayerNorm = AdaLayerNorm
+        self.lstms = nn.ModuleList()
+        for block in src.lstms:
+            if isinstance(block, AdaLayerNorm):
+                self.lstms.append(block)
+            else:
+                self.lstms.append(CoreMLPackedBidirLSTM(block))
+        self.dropout = src.dropout
+        self.d_model = src.d_model
+        self.sty_dim = src.sty_dim
+
+    def forward(self, x, style, text_lengths, m):
+        # m: [B, T] bool, True = padded.
+        masks = m
+        x = x.permute(2, 0, 1)
+        s = style.expand(x.shape[0], x.shape[1], -1)
+        x = torch.cat([x, s], axis=-1)
+        x = x.masked_fill(masks.unsqueeze(-1).transpose(0, 1), 0.0)
+        x = x.transpose(0, 1)
+        x = x.transpose(-1, -2)
+        for block in self.lstms:
+            if isinstance(block, self.AdaLayerNorm):
+                x = block(x.transpose(-1, -2), style).transpose(-1, -2)
+                x = torch.cat([x, s.permute(1, 2, 0)], axis=1)
+                x = x.masked_fill(masks.unsqueeze(-1).transpose(-1, -2), 0.0)
+            else:
+                x = x.transpose(-1, -2)
+                x = block(x, text_lengths, m)
+                x = F.dropout(x, p=self.dropout, training=False)
+                x = x.transpose(-1, -2)
+        return x.transpose(-1, -2)
+
+
+# ---------------------------------------------------------------------------
 # Split pipeline wrappers for export
 # ---------------------------------------------------------------------------
 class KokoroModelA(nn.Module):
@@ -359,7 +482,9 @@ class KokoroModelA(nn.Module):
         self.bert = model.bert
         self.bert_encoder = model.bert_encoder
         self.predictor = model.predictor
-        self.text_encoder = model.text_encoder
+        self.predictor_text_encoder = CoreMLDurationEncoder(model.predictor.text_encoder)
+        self.predictor_duration_lstm = CoreMLPackedBidirLSTM(model.predictor.lstm)
+        self.text_encoder = CoreMLTextEncoder(model.text_encoder)
         self.gen_frontend = GeneratorFrontEnd(model.decoder.generator)
 
     def forward(self, input_ids, attention_mask, ref_s, speed, random_phases):
@@ -388,8 +513,8 @@ class KokoroModelA(nn.Module):
 
         s = ref_s[:, S_CONTENT_DIM:]
 
-        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-        x, _ = self.predictor.lstm(d)
+        d = self.predictor_text_encoder(d_en, s, input_lengths, text_mask)
+        x = self.predictor_duration_lstm(d, input_lengths, text_mask)
         duration = self.predictor.duration_proj(x)
         duration = torch.sigmoid(duration).sum(dim=-1) / speed[0]
         pred_dur = torch.round(duration).clamp(min=1).long()
