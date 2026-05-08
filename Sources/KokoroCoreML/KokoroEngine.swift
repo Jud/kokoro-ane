@@ -351,8 +351,9 @@ public final class KokoroEngine: @unchecked Sendable {
 
     private static let hpAlpha: Float = 1.0 - (2.0 * .pi * 80.0 / Float(sampleRate))
 
-    /// Post-process audio in-place: high-pass filter, presence boost, peak normalize.
-    private static func postProcess(_ samples: inout [Float]) {
+    /// HP filter + presence-boost EQ. Precharges from the chunk head, so it's
+    /// safe to call per chunk without audible seams.
+    private static func applyFiltering(_ samples: inout [Float]) {
         guard samples.count > 1 else { return }
 
         let alpha = hpAlpha
@@ -387,6 +388,12 @@ public final class KokoroEngine: @unchecked Sendable {
             y2 = y1; y1 = y
             samples[i] = y
         }
+    }
+
+    /// Post-process audio in-place: high-pass filter, presence boost, peak normalize.
+    private static func postProcess(_ samples: inout [Float]) {
+        guard samples.count > 1 else { return }
+        applyFiltering(&samples)
 
         var peak: Float = 0
         vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
@@ -394,6 +401,46 @@ public final class KokoroEngine: @unchecked Sendable {
             var scale = Float(0.95) / peak
             vDSP_vsmul(samples, 1, &scale, &samples, 1, vDSP_Length(samples.count))
         }
+    }
+
+    /// Gain ceiling for streaming normalization. Caps boost on quiet utterances.
+    private static let streamGainCeiling: Float = 2.0
+
+    /// Gain floor for streaming normalization. Prevents attenuation of loud chunks.
+    private static let streamGainFloor: Float = 1.0
+
+    /// Compute fixed gain from a chunk's peak so all chunks in the stream use
+    /// the same scale — avoids the loudness jumps you'd get from per-chunk
+    /// peak normalization.
+    private static func computeStreamGain(from samples: [Float]) -> Float {
+        var peak: Float = 0
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
+        guard peak > 0.001 else { return 1.0 }
+        let raw = Float(0.95) / peak
+        return min(streamGainCeiling, max(streamGainFloor, raw))
+    }
+
+    /// Apply gain in-place and hard-clip to ±0.95.
+    private static func applyStreamGain(_ samples: inout [Float], gain: Float) {
+        var g = gain
+        vDSP_vsmul(samples, 1, &g, &samples, 1, vDSP_Length(samples.count))
+        var lo: Float = -0.95
+        var hi: Float = 0.95
+        vDSP_vclip(samples, 1, &lo, &hi, &samples, 1, vDSP_Length(samples.count))
+    }
+
+    /// Build a 100ms silence buffer for inter-chunk gaps in the stream.
+    private static func makeInterChunkSilenceBuffer() -> AVAudioPCMBuffer? {
+        guard
+            let buffer = AVAudioPCMBuffer(
+                pcmFormat: audioFormat,
+                frameCapacity: AVAudioFrameCount(interChunkSilence))
+        else { return nil }
+        buffer.frameLength = AVAudioFrameCount(interChunkSilence)
+        if let channel = buffer.floatChannelData?[0] {
+            memset(channel, 0, interChunkSilence * MemoryLayout<Float>.stride)
+        }
+        return buffer
     }
 
     // MARK: - Voices
@@ -1007,6 +1054,8 @@ public final class KokoroEngine: @unchecked Sendable {
         return AsyncStream { continuation in
             let thread = Thread {
                 let format = Self.audioFormat
+                var streamGain: Float? = nil
+                var emittedFirst = false
 
                 for tokenIds in mergedIds {
                     if Thread.current.isCancelled { break }
@@ -1019,10 +1068,19 @@ public final class KokoroEngine: @unchecked Sendable {
                             tokenIds: tokenIds, styleVector: styleVector,
                             speed: clampedSpeed)
                         Self.applyFades(&samples)
-                        Self.postProcess(&samples)
+                        Self.applyFiltering(&samples)
+                        if streamGain == nil {
+                            streamGain = Self.computeStreamGain(from: samples)
+                        }
+                        Self.applyStreamGain(&samples, gain: streamGain!)
+
+                        if emittedFirst, let silence = Self.makeInterChunkSilenceBuffer() {
+                            continuation.yield(.audio(silence))
+                        }
 
                         if let buffer = Self.makePCMBuffer(from: samples, format: format) {
                             continuation.yield(.audio(buffer))
+                            emittedFirst = true
                         }
                     } catch {
                         Self.logger.error(
@@ -1053,6 +1111,8 @@ public final class KokoroEngine: @unchecked Sendable {
         return AsyncStream { continuation in
             let thread = Thread {
                 let format = Self.audioFormat
+                var streamGain: Float? = nil
+                var emittedFirst = false
 
                 for tokenIds in mergedIds {
                     if Thread.current.isCancelled { break }
@@ -1062,10 +1122,19 @@ public final class KokoroEngine: @unchecked Sendable {
                             tokenIds: tokenIds, styleVector: styleVector,
                             speed: clampedSpeed)
                         Self.applyFades(&samples)
-                        Self.postProcess(&samples)
+                        Self.applyFiltering(&samples)
+                        if streamGain == nil {
+                            streamGain = Self.computeStreamGain(from: samples)
+                        }
+                        Self.applyStreamGain(&samples, gain: streamGain!)
+
+                        if emittedFirst, let silence = Self.makeInterChunkSilenceBuffer() {
+                            continuation.yield(.audio(silence))
+                        }
 
                         if let buffer = Self.makePCMBuffer(from: samples, format: format) {
                             continuation.yield(.audio(buffer))
+                            emittedFirst = true
                         }
                     } catch {
                         Self.logger.error(
