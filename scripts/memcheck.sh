@@ -29,7 +29,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROJECT="${REPO_ROOT}/Examples/KokoroApp/KokoroApp.xcodeproj"
+APP_DIR="${REPO_ROOT}/Examples/KokoroApp"
+PROJECT="${APP_DIR}/KokoroApp.xcodeproj"
 SCHEME="KokoroApp"
 BUNDLE_ID="com.kokoro.app"
 
@@ -91,6 +92,16 @@ if [ "$state" != "Booted" ]; then
   log "Booting simulator..."
   xcrun simctl boot "$UDID"
   sleep 3
+fi
+
+if [ ! -d "$PROJECT" ]; then
+  log "Xcode project missing, generating from project.yml..."
+  if ! command -v xcodegen >/dev/null 2>&1; then
+    log "ERROR: xcodegen not found; install with 'brew install xcodegen' or commit a tracked project"
+    exit 3
+  fi
+  (cd "$APP_DIR" && xcodegen generate > "${ARTIFACTS_DIR}/xcodegen.log" 2>&1) \
+    || { log "ERROR: xcodegen failed — see ${ARTIFACTS_DIR}/xcodegen.log"; tail -20 "${ARTIFACTS_DIR}/xcodegen.log"; exit 3; }
 fi
 
 log "Building app..."
@@ -186,6 +197,11 @@ teardown = next((e for e in events if e["name"] == "teardown"), None)
 post_load = next((e for e in events if e["name"] == "post_engine_load"), None)
 residual = (teardown["mb"] - baseline) if teardown else None
 
+error_events = [e for e in events if e["name"] in ("error", "chunk_failed")]
+case_starts = sum(1 for e in events if e["name"] == "case_start")
+case_ends = sum(1 for e in events if e["name"] == "case_end")
+first_buffers = sum(1 for e in events if e["name"] == "first_buffer")
+
 print(f"baseline:       {baseline:7.1f} MB")
 if post_load:
     print(f"engine load:   +{post_load['mb'] - baseline:7.1f} MB  (resident after model load)")
@@ -204,6 +220,15 @@ for ev in events:
 print()
 
 failures = []
+if error_events:
+    names = ", ".join(f"{e['name']}({(e.get('detail') or '')[:60]})" for e in error_events[:5])
+    failures.append(f"runtime errors logged: {names}")
+if case_starts == 0:
+    failures.append("no synthesis cases ran")
+elif case_ends != case_starts:
+    failures.append(f"only {case_ends}/{case_starts} cases completed")
+elif first_buffers != case_starts:
+    failures.append(f"only {first_buffers}/{case_starts} cases produced audio")
 if peak > peak_budget:
     failures.append(f"peak {peak:.1f} MB > budget {peak_budget:.0f} MB")
 if delta > delta_budget:
@@ -214,7 +239,7 @@ if failures:
     print("FAIL: " + "; ".join(failures))
     sys.exit(1)
 else:
-    print("Within budget.")
+    print(f"Within budget ({case_ends}/{case_starts} cases, {first_buffers} produced audio).")
     sys.exit(0)
 PY
 then
