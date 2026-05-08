@@ -4,8 +4,12 @@ import SwiftUI
 struct KokoroAppApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .preferredColorScheme(.dark)
+            if MemoryTestRunner.isRequested {
+                MemoryTestView()
+            } else {
+                ContentView()
+                    .preferredColorScheme(.dark)
+            }
         }
     }
 }
