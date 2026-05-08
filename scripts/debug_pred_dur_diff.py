@@ -101,7 +101,9 @@ def main():
     for text in args.texts:
         token_ids = tokenize(text, pipeline)
         real_n = len(token_ids)
-        ref_s = voice[real_n - 1]
+        # Match pipeline.py: pack[len(ps)-1] where ps is the phoneme string
+        # (token_ids minus the BOS/EOS bracketing). real_n = len(ps) + 2.
+        ref_s = voice[real_n - 3]
         if ref_s.dim() == 1:
             ref_s = ref_s.unsqueeze(0)
 
