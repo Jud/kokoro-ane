@@ -256,19 +256,21 @@ public final class KokoroEngine: @unchecked Sendable {
         for tokenIds in mergedIds {
             totalTokens += tokenIds.count
 
-            let styleVector = try voiceStore.embedding(
-                for: voice, tokenCount: tokenIds.count - 2)
+            try autoreleasepool {
+                let styleVector = try voiceStore.embedding(
+                    for: voice, tokenCount: tokenIds.count - 2)
 
-            var (samples, durations) = try synthesizeChunk(
-                tokenIds: tokenIds, styleVector: styleVector, speed: speed)
+                var (samples, durations) = try synthesizeChunk(
+                    tokenIds: tokenIds, styleVector: styleVector, speed: speed)
 
-            Self.applyFades(&samples)
-            if !allSamples.isEmpty {
-                allSamples.append(
-                    contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+                Self.applyFades(&samples)
+                if !allSamples.isEmpty {
+                    allSamples.append(
+                        contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+                }
+                allSamples.append(contentsOf: samples)
+                allDurations.append(contentsOf: durations)
             }
-            allSamples.append(contentsOf: samples)
-            allDurations.append(contentsOf: durations)
         }
 
         Self.postProcess(&allSamples)
@@ -292,16 +294,18 @@ public final class KokoroEngine: @unchecked Sendable {
         for tokenIds in mergedIds {
             totalTokens += tokenIds.count
 
-            var (samples, durations) = try synthesizeChunk(
-                tokenIds: tokenIds, styleVector: styleVector, speed: speed)
+            try autoreleasepool {
+                var (samples, durations) = try synthesizeChunk(
+                    tokenIds: tokenIds, styleVector: styleVector, speed: speed)
 
-            Self.applyFades(&samples)
-            if !allSamples.isEmpty {
-                allSamples.append(
-                    contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+                Self.applyFades(&samples)
+                if !allSamples.isEmpty {
+                    allSamples.append(
+                        contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+                }
+                allSamples.append(contentsOf: samples)
+                allDurations.append(contentsOf: durations)
             }
-            allSamples.append(contentsOf: samples)
-            allDurations.append(contentsOf: durations)
         }
 
         Self.postProcess(&allSamples)
@@ -1089,29 +1093,34 @@ public final class KokoroEngine: @unchecked Sendable {
                 for tokenIds in mergedIds {
                     if Thread.current.isCancelled { break }
 
-                    do {
-                        let styleVector = try styleVectorFor(tokenIds.count - 2)
+                    // Drain CoreML's autoreleased MLMultiArrays/NSError/etc. between
+                    // chunks. Without this, intermediates accumulate for the entire
+                    // utterance and peak memory scales linearly with chunk count.
+                    autoreleasepool {
+                        do {
+                            let styleVector = try styleVectorFor(tokenIds.count - 2)
 
-                        var (samples, _) = try synthesizeChunk(
-                            tokenIds: tokenIds, styleVector: styleVector, speed: speed)
-                        Self.applyFades(&samples)
-                        Self.applyFiltering(&samples)
-                        let gain = streamGain ?? Self.computeStreamGain(from: samples)
-                        streamGain = gain
-                        Self.applyStreamGain(&samples, gain: gain)
+                            var (samples, _) = try synthesizeChunk(
+                                tokenIds: tokenIds, styleVector: styleVector, speed: speed)
+                            Self.applyFades(&samples)
+                            Self.applyFiltering(&samples)
+                            let gain = streamGain ?? Self.computeStreamGain(from: samples)
+                            streamGain = gain
+                            Self.applyStreamGain(&samples, gain: gain)
 
-                        if emittedFirst, let silence = Self.interChunkSilenceBuffer {
-                            continuation.yield(.audio(silence))
+                            if emittedFirst, let silence = Self.interChunkSilenceBuffer {
+                                continuation.yield(.audio(silence))
+                            }
+
+                            if let buffer = Self.makePCMBuffer(from: samples, format: format) {
+                                continuation.yield(.audio(buffer))
+                                emittedFirst = true
+                            }
+                        } catch {
+                            Self.logger.error(
+                                "Streaming chunk failed: \(error.localizedDescription)")
+                            continuation.yield(.chunkFailed(error))
                         }
-
-                        if let buffer = Self.makePCMBuffer(from: samples, format: format) {
-                            continuation.yield(.audio(buffer))
-                            emittedFirst = true
-                        }
-                    } catch {
-                        Self.logger.error(
-                            "Streaming chunk failed: \(error.localizedDescription)")
-                        continuation.yield(.chunkFailed(error))
                     }
                 }
 
