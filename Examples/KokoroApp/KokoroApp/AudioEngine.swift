@@ -16,6 +16,7 @@ final class AudioEngine {
     private var avEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
     private var streamTask: Task<Void, Never>?
+    private var generation: UInt64 = 0
     private var _analyzer: SpectrumAnalyzer?
     private var spectrumAnalyzer: SpectrumAnalyzer {
         if let a = _analyzer { return a }
@@ -39,15 +40,19 @@ final class AudioEngine {
         guard let engine, !text.isEmpty else { return }
 
         stop()
+        let myGeneration = generation
         isSynthesizing = true
         error = nil
 
         streamTask = Task { [weak self] in
-            await self?.run(engine: engine, text: text, voice: voice, speed: speed)
+            await self?.run(
+                engine: engine, text: text, voice: voice,
+                speed: speed, generation: myGeneration)
         }
     }
 
     func stop() {
+        generation &+= 1
         streamTask?.cancel()
         streamTask = nil
         teardown()
@@ -56,13 +61,22 @@ final class AudioEngine {
 
     // MARK: - Private
 
-    private func run(engine: KokoroEngine, text: String, voice: String, speed: Float) async {
+    private func run(
+        engine: KokoroEngine, text: String, voice: String,
+        speed: Float, generation myGeneration: UInt64
+    ) async {
+        func current() -> Bool {
+            !Task.isCancelled && self.generation == myGeneration
+        }
+
         let player: AVAudioPlayerNode
         do {
             player = try startPlayback()
         } catch {
-            self.error = "Playback setup failed: \(error.localizedDescription)"
-            self.isSynthesizing = false
+            if current() {
+                self.error = "Playback setup failed: \(error.localizedDescription)"
+                self.isSynthesizing = false
+            }
             return
         }
 
@@ -70,7 +84,7 @@ final class AudioEngine {
             let stream = try engine.speak(text, voice: voice, speed: speed)
             var firstBuffer = true
             for await event in stream {
-                if Task.isCancelled || self.playerNode !== player { break }
+                if !current() { break }
                 switch event {
                 case .audio(let buffer):
                     if firstBuffer {
@@ -83,7 +97,7 @@ final class AudioEngine {
                 }
             }
         } catch {
-            if self.playerNode === player {
+            if current() {
                 self.error = "Synthesis failed: \(error.localizedDescription)"
                 self.isSynthesizing = false
                 teardown()
@@ -91,10 +105,10 @@ final class AudioEngine {
             return
         }
 
-        if Task.isCancelled || self.playerNode !== player { return }
+        if !current() { return }
 
         self.isSynthesizing = false
-        scheduleEndSentinel(on: player)
+        scheduleEndSentinel(on: player, generation: myGeneration)
     }
 
     private func startPlayback() throws -> AVAudioPlayerNode {
@@ -126,12 +140,12 @@ final class AudioEngine {
         return player
     }
 
-    private func scheduleEndSentinel(on player: AVAudioPlayerNode) {
+    private func scheduleEndSentinel(on player: AVAudioPlayerNode, generation myGeneration: UInt64) {
         guard
             let sentinel = AVAudioPCMBuffer(
                 pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)
         else {
-            if self.playerNode === player { teardown() }
+            if self.generation == myGeneration { teardown() }
             return
         }
         sentinel.frameLength = 1
@@ -140,7 +154,7 @@ final class AudioEngine {
             sentinel, at: nil, options: [], completionCallbackType: .dataPlayedBack
         ) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.playerNode === player else { return }
+                guard let self, self.generation == myGeneration else { return }
                 self.teardown()
             }
         }

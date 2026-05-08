@@ -429,8 +429,9 @@ public final class KokoroEngine: @unchecked Sendable {
         vDSP_vclip(samples, 1, &lo, &hi, &samples, 1, vDSP_Length(samples.count))
     }
 
-    /// Build a 100ms silence buffer for inter-chunk gaps in the stream.
-    private static func makeInterChunkSilenceBuffer() -> AVAudioPCMBuffer? {
+    /// Shared 100ms silence buffer for inter-chunk gaps. Read-only after init,
+    /// so it's safe to enqueue the same instance on the player node every call.
+    private static let interChunkSilenceBuffer: AVAudioPCMBuffer? = {
         guard
             let buffer = AVAudioPCMBuffer(
                 pcmFormat: audioFormat,
@@ -441,7 +442,7 @@ public final class KokoroEngine: @unchecked Sendable {
             memset(channel, 0, interChunkSilence * MemoryLayout<Float>.stride)
         }
         return buffer
-    }
+    }()
 
     // MARK: - Voices
 
@@ -1051,50 +1052,8 @@ public final class KokoroEngine: @unchecked Sendable {
         let (_, mergedIds) = prepareChunks(text: text)
         guard !mergedIds.isEmpty else { return AsyncStream { $0.finish() } }
 
-        return AsyncStream { continuation in
-            let thread = Thread {
-                let format = Self.audioFormat
-                var streamGain: Float? = nil
-                var emittedFirst = false
-
-                for tokenIds in mergedIds {
-                    if Thread.current.isCancelled { break }
-
-                    do {
-                        let styleVector = try self.voiceStore.embedding(
-                            for: voice, tokenCount: tokenIds.count - 2)
-
-                        var (samples, _) = try self.synthesizeChunk(
-                            tokenIds: tokenIds, styleVector: styleVector,
-                            speed: clampedSpeed)
-                        Self.applyFades(&samples)
-                        Self.applyFiltering(&samples)
-                        if streamGain == nil {
-                            streamGain = Self.computeStreamGain(from: samples)
-                        }
-                        Self.applyStreamGain(&samples, gain: streamGain!)
-
-                        if emittedFirst, let silence = Self.makeInterChunkSilenceBuffer() {
-                            continuation.yield(.audio(silence))
-                        }
-
-                        if let buffer = Self.makePCMBuffer(from: samples, format: format) {
-                            continuation.yield(.audio(buffer))
-                            emittedFirst = true
-                        }
-                    } catch {
-                        Self.logger.error(
-                            "Streaming chunk failed: \(error.localizedDescription)")
-                        continuation.yield(.chunkFailed(error))
-                    }
-                }
-
-                continuation.finish()
-            }
-            thread.stackSize = 8 * 1024 * 1024
-            nonisolated(unsafe) let unsafeThread = thread
-            continuation.onTermination = { _ in unsafeThread.cancel() }
-            thread.start()
+        return streamSpeakLoop(mergedIds: mergedIds, speed: clampedSpeed) { tokenCount in
+            try self.voiceStore.embedding(for: voice, tokenCount: tokenCount)
         }
     }
 
@@ -1108,8 +1067,21 @@ public final class KokoroEngine: @unchecked Sendable {
         let (_, mergedIds) = prepareChunks(text: text)
         guard !mergedIds.isEmpty else { return AsyncStream { $0.finish() } }
 
+        return streamSpeakLoop(mergedIds: mergedIds, speed: clampedSpeed) { _ in
+            styleVector
+        }
+    }
+
+    /// Run the per-chunk synthesis loop on a worker thread and yield
+    /// playback-ready buffers. The style-vector source is parameterized so
+    /// both `speak` overloads share this implementation.
+    private func streamSpeakLoop(
+        mergedIds: [[Int]],
+        speed: Float,
+        styleVectorFor: @escaping @Sendable (Int) throws -> [Float]
+    ) -> AsyncStream<SpeakEvent> {
         return AsyncStream { continuation in
-            let thread = Thread {
+            let thread = Thread { [self] in
                 let format = Self.audioFormat
                 var streamGain: Float? = nil
                 var emittedFirst = false
@@ -1118,17 +1090,17 @@ public final class KokoroEngine: @unchecked Sendable {
                     if Thread.current.isCancelled { break }
 
                     do {
-                        var (samples, _) = try self.synthesizeChunk(
-                            tokenIds: tokenIds, styleVector: styleVector,
-                            speed: clampedSpeed)
+                        let styleVector = try styleVectorFor(tokenIds.count - 2)
+
+                        var (samples, _) = try synthesizeChunk(
+                            tokenIds: tokenIds, styleVector: styleVector, speed: speed)
                         Self.applyFades(&samples)
                         Self.applyFiltering(&samples)
-                        if streamGain == nil {
-                            streamGain = Self.computeStreamGain(from: samples)
-                        }
-                        Self.applyStreamGain(&samples, gain: streamGain!)
+                        let gain = streamGain ?? Self.computeStreamGain(from: samples)
+                        streamGain = gain
+                        Self.applyStreamGain(&samples, gain: gain)
 
-                        if emittedFirst, let silence = Self.makeInterChunkSilenceBuffer() {
+                        if emittedFirst, let silence = Self.interChunkSilenceBuffer {
                             continuation.yield(.audio(silence))
                         }
 
