@@ -83,16 +83,17 @@ final class AudioEngine {
                 }
             }
         } catch {
-            self.error = "Synthesis failed: \(error.localizedDescription)"
-            self.isSynthesizing = false
-            if self.playerNode === player { teardown() }
+            if self.playerNode === player {
+                self.error = "Synthesis failed: \(error.localizedDescription)"
+                self.isSynthesizing = false
+                teardown()
+            }
             return
         }
 
-        self.isSynthesizing = false
-
         if Task.isCancelled || self.playerNode !== player { return }
 
+        self.isSynthesizing = false
         scheduleEndSentinel(on: player)
     }
 
