@@ -74,6 +74,55 @@ public final class KokoroEngine: @unchecked Sendable {
     /// Silence samples inserted between chunks (100ms at 24kHz).
     private static let interChunkSilence = 2400
 
+    /// Minimum audio to keep before the first non-BOS token when trimming BOS output.
+    private static let minLeadingBOSPreroll = 960  // 40ms at 24kHz
+
+    /// Fast-speech floor for adaptive BOS preroll.
+    private static let minFastLeadingBOSPreroll = 720  // 30ms at 24kHz
+
+    /// Maximum audio to keep before the first non-BOS token when trimming BOS output.
+    private static let maxLeadingBOSPreroll = 2040  // 85ms at 24kHz
+
+    /// Tail of the BOS span scanned for onset energy.
+    private static let leadingBOSSearchWindow = 3000  // 125ms at 24kHz
+
+    /// RMS analysis window for adaptive BOS trimming.
+    private static let leadingBOSAnalysisWindow = 120  // 5ms at 24kHz
+
+    /// Small margin kept before detected onset so fade-in does not eat the transient.
+    private static let leadingBOSOnsetMargin = 120  // 5ms at 24kHz
+
+    /// Number of windows from the BOS head averaged to estimate the silent baseline.
+    private static let leadingBOSBaselineWindowCount = 5
+
+    /// Onset RMS threshold as a fraction of peak BOS RMS.
+    private static let leadingBOSPeakRMSFraction: Float = 0.10
+
+    /// Onset RMS threshold as a multiple of baseline RMS.
+    private static let leadingBOSBaselineRMSMultiplier: Float = 8.0
+
+    /// Absolute RMS floor below which a window is treated as silence.
+    private static let leadingBOSNoiseFloorRMS: Float = 0.00002
+
+    /// Windows of lookahead used to confirm a candidate onset is sustained.
+    private static let leadingBOSOnsetLookaheadWindows = 5
+
+    /// Required windows above threshold within the lookahead to accept an onset.
+    private static let leadingBOSOnsetSustainWindows = 3
+
+    /// Length of the trailing fade-out applied by `applyFades` (50ms at 24kHz).
+    private static let fadeOutSamples = 1200
+
+    /// Minimum audio to keep after the last non-EOS token when trimming EOS output.
+    /// Must cover `fadeOutSamples` so the fade attenuates only EOS audio.
+    private static let minTrailingEOSPostroll = fadeOutSamples
+
+    /// Maximum audio to keep after the last non-EOS token when trimming EOS output.
+    private static let maxTrailingEOSPostroll = 2040  // 85ms at 24kHz
+
+    /// RMS drop ratio that signals the speech-tail → EOS-schwa transition (≈12 dB).
+    private static let trailingEOSDropRatio: Float = 4.0
+
     private enum Feature {
         static let inputIds = "input_ids"
         static let attentionMask = "attention_mask"
@@ -273,7 +322,7 @@ public final class KokoroEngine: @unchecked Sendable {
             var ramp: Float = 0
             var step = 1.0 / Float(fadeIn)
             vDSP_vrampmul(ptr, 1, &ramp, &step, ptr, 1, vDSP_Length(fadeIn))
-            let fadeOut = min(1200, buf.count)
+            let fadeOut = min(fadeOutSamples, buf.count)
             let fadeStart = buf.count - fadeOut
             ramp = 1.0
             step = -1.0 / Float(fadeOut)
@@ -706,11 +755,179 @@ public final class KokoroEngine: @unchecked Sendable {
         // audible as a schwa before unvoiced fricatives (e.g. "uh-Switch").
         if let leadingFrames = durations.first, leadingFrames > 0 {
             let leadSamples = min(leadingFrames * Self.hopSize, samples.count)
-            samples.removeFirst(leadSamples)
+            let trimSamples = Self.adaptiveLeadingBOSTrimSamples(
+                in: samples, leadSamples: leadSamples, speed: speed)
+            if trimSamples > 0 {
+                samples.removeFirst(trimSamples)
+            }
+        }
+
+        // Mirror the BOS trim on the trailing EOS token. Voice-dependent: some voices
+        // (notably bf_lily) emit a soft trailing schwa that sits ~150ms before the file
+        // end — outside removeTailArtifact's 100ms search window.
+        if durations.count > 1,
+            let trailingFrames = durations.last, trailingFrames > 0
+        {
+            let trailSamples = min(trailingFrames * Self.hopSize, samples.count)
+            let trimSamples = Self.adaptiveTrailingEOSTrimSamples(
+                in: samples, trailSamples: trailSamples, speed: speed)
+            if trimSamples > 0 {
+                samples.removeLast(trimSamples)
+            }
         }
 
         Self.removeTailArtifact(&samples)
         return (samples, durations)
+    }
+
+    /// Compute per-window RMS over `samples[start..<end]` in non-overlapping `windowSize`
+    /// chunks. Trailing samples that don't fill a full window are dropped.
+    private static func rmsWindows(
+        in samples: [Float], from start: Int, to end: Int, windowSize: Int
+    ) -> [(offset: Int, rms: Float)] {
+        let capacity = max(0, (end - start) / windowSize)
+        var windows: [(offset: Int, rms: Float)] = []
+        windows.reserveCapacity(capacity)
+        var offset = start
+        while offset + windowSize <= end {
+            var sumSquares: Float = 0
+            for i in offset..<(offset + windowSize) {
+                let sample = samples[i]
+                sumSquares += sample * sample
+            }
+            windows.append((offset, sqrtf(sumSquares / Float(windowSize))))
+            offset += windowSize
+        }
+        return windows
+    }
+
+    /// Choose how much of the leading BOS span to remove without cutting first-phoneme onset.
+    static func adaptiveLeadingBOSTrimSamples(
+        in samples: [Float], leadSamples: Int, speed: Float
+    ) -> Int {
+        guard leadSamples > 0 else { return 0 }
+
+        let clampedLeadSamples = min(leadSamples, samples.count)
+        let speedScale = 1.0 / max(1.0, speed)
+        let scaledMinPreroll = max(
+            minFastLeadingBOSPreroll,
+            Int((Float(minLeadingBOSPreroll) * speedScale).rounded()))
+        let scaledMaxPreroll = max(
+            scaledMinPreroll,
+            Int((Float(maxLeadingBOSPreroll) * speedScale).rounded()))
+
+        let minPreroll = min(scaledMinPreroll, clampedLeadSamples)
+        let maxPreroll = min(scaledMaxPreroll, clampedLeadSamples)
+        let fallbackPreroll = min(leadingBOSOnsetMargin, clampedLeadSamples)
+        let searchStart = max(0, clampedLeadSamples - leadingBOSSearchWindow)
+        let window = leadingBOSAnalysisWindow
+        // Extend past the BOS boundary so an onset right at the boundary still has
+        // enough lookahead samples to confirm sustain.
+        let analysisEnd = min(samples.count, clampedLeadSamples + 2 * window)
+        guard analysisEnd - searchStart >= window else {
+            return max(0, clampedLeadSamples - fallbackPreroll)
+        }
+
+        let rmsWindows = Self.rmsWindows(
+            in: samples, from: searchStart, to: analysisEnd, windowSize: window)
+
+        var maxBOSRMS: Float = 0
+        var baselineSum: Float = 0
+        var baselineCount = 0
+        for entry in rmsWindows {
+            guard entry.offset < clampedLeadSamples else { break }
+            if entry.rms > maxBOSRMS { maxBOSRMS = entry.rms }
+            if baselineCount < leadingBOSBaselineWindowCount {
+                baselineSum += entry.rms
+                baselineCount += 1
+            }
+        }
+        guard maxBOSRMS > 0, baselineCount > 0 else {
+            return max(0, clampedLeadSamples - fallbackPreroll)
+        }
+
+        let baselineRMS = baselineSum / Float(baselineCount)
+        let threshold = max(
+            maxBOSRMS * leadingBOSPeakRMSFraction,
+            baselineRMS * leadingBOSBaselineRMSMultiplier,
+            leadingBOSNoiseFloorRMS)
+
+        var onsetOffset: Int?
+        for index in rmsWindows.indices {
+            guard rmsWindows[index].offset < clampedLeadSamples else { break }
+            guard rmsWindows[index].rms >= threshold else { continue }
+
+            let lookaheadEnd = min(index + leadingBOSOnsetLookaheadWindows, rmsWindows.count)
+            let sustainedWindows = rmsWindows[index..<lookaheadEnd]
+                .count(where: { $0.rms >= threshold })
+
+            if sustainedWindows >= leadingBOSOnsetSustainWindows {
+                onsetOffset = rmsWindows[index].offset
+                break
+            }
+        }
+
+        let preroll: Int
+        if let onsetOffset {
+            let detectedPreroll = clampedLeadSamples - onsetOffset + leadingBOSOnsetMargin
+            preroll = min(maxPreroll, max(minPreroll, detectedPreroll))
+        } else {
+            preroll = fallbackPreroll
+        }
+
+        return max(0, clampedLeadSamples - preroll)
+    }
+
+    /// Choose how much of the trailing EOS span to remove without cutting last-phoneme tail.
+    /// Scans the EOS span for a sharp RMS drop (≈12 dB) that marks the speech-tail →
+    /// schwa transition, then trims from there using a clamped postroll budget. Falls
+    /// back to `minPostroll` when no drop is found (uniformly silent EOS, e.g. voices
+    /// with no audible trailing schwa).
+    static func adaptiveTrailingEOSTrimSamples(
+        in samples: [Float], trailSamples: Int, speed: Float
+    ) -> Int {
+        guard trailSamples > 0 else { return 0 }
+
+        let clampedTrailSamples = min(trailSamples, samples.count)
+        let speedScale = 1.0 / max(1.0, speed)
+        let minPostroll = min(minTrailingEOSPostroll, clampedTrailSamples)
+        let maxPostroll = min(
+            max(minPostroll, Int((Float(maxTrailingEOSPostroll) * speedScale).rounded())),
+            clampedTrailSamples)
+        let eosStart = samples.count - clampedTrailSamples
+        let window = leadingBOSAnalysisWindow
+        // Look back 2 windows before EOS to anchor the drop comparison in real speech tail.
+        let analysisStart = max(0, eosStart - 2 * window)
+
+        guard samples.count - analysisStart >= window else {
+            return max(0, clampedTrailSamples - minPostroll)
+        }
+
+        let rmsWindows = Self.rmsWindows(
+            in: samples, from: analysisStart, to: samples.count, windowSize: window)
+
+        var boundaryOffset: Int?
+        for index in 1..<rmsWindows.count {
+            let curr = rmsWindows[index]
+            guard curr.offset >= eosStart else { continue }
+            let prev = rmsWindows[index - 1]
+            if prev.rms > leadingBOSNoiseFloorRMS,
+                prev.rms > curr.rms * trailingEOSDropRatio
+            {
+                boundaryOffset = curr.offset
+                break
+            }
+        }
+
+        let postroll: Int
+        if let boundaryOffset {
+            let detectedPostroll = boundaryOffset - eosStart + leadingBOSOnsetMargin
+            postroll = min(maxPostroll, max(minPostroll, detectedPostroll))
+        } else {
+            postroll = minPostroll
+        }
+
+        return max(0, clampedTrailSamples - postroll)
     }
 
     /// Remove spurious spike artifacts from the tail of synthesized audio.
