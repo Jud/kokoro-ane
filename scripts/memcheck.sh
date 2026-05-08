@@ -4,11 +4,27 @@
 #
 # Usage:
 #   scripts/memcheck.sh                       # default thresholds + sim
-#   PEAK_MB=300 scripts/memcheck.sh           # override peak budget
+#   PEAK_MB=4500 scripts/memcheck.sh          # override peak budget
+#   LEAK_MB=120 scripts/memcheck.sh           # post-run residual budget
 #   DEVICE_NAME="iPhone 16" scripts/memcheck.sh
 #   XCTRACE=1 scripts/memcheck.sh             # also record an Allocations trace
 #
-# Exits non-zero if peak phys_footprint exceeds PEAK_MB (default 300).
+# Important: simulator memory is NOT a faithful proxy for device memory.
+# CoreML's GPU/MPS working set counts against phys_footprint differently
+# than ANE allocations on real hardware. Use this script to:
+#   1. Detect leaks: teardown footprint should return near baseline.
+#   2. Detect regressions: peak shouldn't grow run-over-run.
+#   3. Compare optimizations: same suite before/after a change.
+# For absolute "won't get jetsamed on iPhone SE", run on real hardware.
+#
+# Exit codes:
+#   0  pass
+#   1  budget exceeded
+#   2  simulator setup failed
+#   3  build failed
+#   4  built app not found
+#   5  test run timed out
+#   10 result markers not found in log
 
 set -euo pipefail
 
@@ -18,8 +34,12 @@ SCHEME="KokoroApp"
 BUNDLE_ID="com.kokoro.app"
 
 DEVICE_NAME="${DEVICE_NAME:-iPhone SE (3rd generation)}"
-PEAK_MB="${PEAK_MB:-300}"
-DELTA_MB="${DELTA_MB:-250}"
+# Simulator-realistic defaults. CoreML on simulator uses CPU/Metal, which
+# has a much larger working set than ANE on real device. These are picked
+# to flag regressions; real-device numbers are typically 10-20x lower.
+PEAK_MB="${PEAK_MB:-4500}"
+DELTA_MB="${DELTA_MB:-4500}"
+LEAK_MB="${LEAK_MB:-150}"
 TIMEOUT_S="${TIMEOUT_S:-180}"
 XCTRACE="${XCTRACE:-0}"
 ARTIFACTS_DIR="${REPO_ROOT}/.memcheck"
@@ -149,27 +169,53 @@ with open(out_path, "w") as out:
 print(out_path)
 PY
 
-if ! python3 - "$JSON_OUT" "$PEAK_MB" "$DELTA_MB" <<'PY'
+if ! python3 - "$JSON_OUT" "$PEAK_MB" "$DELTA_MB" "$LEAK_MB" <<'PY'
 import json, sys
-path, peak_budget, delta_budget = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+path = sys.argv[1]
+peak_budget = float(sys.argv[2])
+delta_budget = float(sys.argv[3])
+leak_budget = float(sys.argv[4])
 data = json.load(open(path))
 peak = data["peakMB"]
 delta = data["peakDeltaMB"]
 baseline = data["baselineMB"]
 duration = data["durationSeconds"]
-print(f"baseline:    {baseline:7.1f} MB")
-print(f"peak:        {peak:7.1f} MB  (budget {peak_budget:.0f} MB)")
-print(f"peak delta:  {delta:7.1f} MB  (budget {delta_budget:.0f} MB)")
-print(f"duration:    {duration:7.1f} s")
-print(f"events:      {len(data['events'])}")
-print(f"samples:     {len(data['samples'])}")
+events = data["events"]
+
+teardown = next((e for e in events if e["name"] == "teardown"), None)
+post_load = next((e for e in events if e["name"] == "post_engine_load"), None)
+residual = (teardown["mb"] - baseline) if teardown else None
+
+print(f"baseline:       {baseline:7.1f} MB")
+if post_load:
+    print(f"engine load:   +{post_load['mb'] - baseline:7.1f} MB  (resident after model load)")
+print(f"peak:           {peak:7.1f} MB  (budget {peak_budget:.0f} MB)")
+print(f"peak delta:    +{delta:7.1f} MB  (budget {delta_budget:.0f} MB)")
+if teardown:
+    print(f"residual:      +{residual:7.1f} MB  (budget {leak_budget:.0f} MB) — should be near 0")
+print(f"duration:       {duration:7.1f} s")
+print(f"events:         {len(events)}")
+print(f"samples:        {len(data['samples'])}")
 print()
 print("Lifecycle events (mb):")
-for ev in data["events"]:
+for ev in events:
     detail = f"  [{ev['detail']}]" if ev.get("detail") else ""
     print(f"  {ev['timeSeconds']:6.2f}s  {ev['name']:24s} {ev['mb']:7.1f}{detail}")
-ok = peak <= peak_budget and delta <= delta_budget
-sys.exit(0 if ok else 1)
+print()
+
+failures = []
+if peak > peak_budget:
+    failures.append(f"peak {peak:.1f} MB > budget {peak_budget:.0f} MB")
+if delta > delta_budget:
+    failures.append(f"peak delta {delta:.1f} MB > budget {delta_budget:.0f} MB")
+if teardown and residual > leak_budget:
+    failures.append(f"residual {residual:.1f} MB > leak budget {leak_budget:.0f} MB (possible leak)")
+if failures:
+    print("FAIL: " + "; ".join(failures))
+    sys.exit(1)
+else:
+    print("Within budget.")
+    sys.exit(0)
 PY
 then
   log "FAIL: memory budget exceeded"
