@@ -354,9 +354,9 @@ def load_kokoro_model():
 # get distorted durations.
 #
 # CoreMLPackedBidirLSTM splits a bidir LSTM into two unidirectional LSTMs and
-# reverses only the valid prefix using arange + where + gather — all static ops
-# that survive jit.trace + coremltools convert. Math is equivalent to the
-# original packed bidir LSTM under right-padding (our case).
+# reverses only the valid prefix via a permutation matmul — all static ops that
+# survive jit.trace + coremltools convert. Math is equivalent to the original
+# packed bidir LSTM under right-padding (our case).
 class CoreMLPackedBidirLSTM(nn.Module):
     def __init__(self, src):
         super().__init__()
@@ -394,13 +394,12 @@ class CoreMLPackedBidirLSTM(nn.Module):
         # carries shape forward cleanly. The permutation matrix selects
         # x[rev_idx[i]] for each output position i, where rev_idx flips only
         # the valid prefix (positions 0..L-1) and leaves pads in place. The
-        # same permutation undoes itself, so we use it for both directions.
-        b, t, c = x.shape
-        idx = torch.arange(t, device=x.device, dtype=lengths.dtype).unsqueeze(0).expand(b, t)
+        # permutation is its own inverse, so we use it for both directions.
+        t = x.shape[1]
+        pos = torch.arange(t, device=x.device, dtype=lengths.dtype)
         l = lengths.unsqueeze(1)
-        rev_idx = torch.where(idx < l, l - 1 - idx, idx)
-        positions = torch.arange(t, device=x.device, dtype=rev_idx.dtype).unsqueeze(0)
-        perm = (positions.unsqueeze(0) == rev_idx.unsqueeze(-1)).to(x.dtype)
+        rev_idx = torch.where(pos < l, l - 1 - pos, pos)
+        perm = (pos == rev_idx.unsqueeze(-1)).to(x.dtype)
 
         x_rev = torch.matmul(perm, x)
         y_rev_seq, _ = self.rev(x_rev)
