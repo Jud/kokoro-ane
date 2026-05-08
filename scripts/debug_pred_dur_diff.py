@@ -92,8 +92,12 @@ def main():
     fe_coreml = None
     if args.coreml:
         import coremltools as ct
-        fe_coreml = ct.models.MLModel(
-            args.frontend_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+        if args.frontend_path.endswith(".mlmodelc"):
+            fe_coreml = ct.models.CompiledMLModel(
+                args.frontend_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+        else:
+            fe_coreml = ct.models.MLModel(
+                args.frontend_path, compute_units=ct.ComputeUnit.CPU_ONLY)
 
     voice = pipeline.load_voice(args.voice)
 
