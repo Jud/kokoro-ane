@@ -1129,7 +1129,17 @@ public final class KokoroEngine: @unchecked Sendable {
                     if paceToRealtime {
                         let lead = audioProduced - (CFAbsoluteTimeGetCurrent() - streamStart)
                         if lead > Self.producerLeadSeconds {
-                            Thread.sleep(forTimeInterval: lead - Self.producerLeadSeconds)
+                            // Sleep in short increments so onTermination's
+                            // Thread.cancel() tears the worker down promptly
+                            // instead of waiting out the full pacing delay.
+                            let target =
+                                CFAbsoluteTimeGetCurrent()
+                                + (lead - Self.producerLeadSeconds)
+                            while !Thread.current.isCancelled {
+                                let remaining = target - CFAbsoluteTimeGetCurrent()
+                                if remaining <= 0 { break }
+                                Thread.sleep(forTimeInterval: min(0.05, remaining))
+                            }
                             if Thread.current.isCancelled { break }
                         }
                     }
