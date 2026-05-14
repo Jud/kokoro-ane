@@ -401,11 +401,23 @@ public final class KokoroEngine: @unchecked Sendable {
 
         var peak: Float = 0
         vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
-        if peak > 0.001 {
-            var scale = Float(0.95) / peak
+        if peak > silencePeakThreshold {
+            var scale = targetPeakAmplitude / peak
             vDSP_vsmul(samples, 1, &scale, &samples, 1, vDSP_Length(samples.count))
         }
     }
+
+    /// Target peak amplitude for normalized audio. Sits under 1.0 to leave
+    /// headroom against post-filter overshoot before the playback range.
+    private static let targetPeakAmplitude: Float = 0.95
+
+    /// Peak amplitude under which a chunk is treated as silent — skip gain
+    /// to avoid amplifying numerical noise.
+    private static let silencePeakThreshold: Float = 0.001
+
+    /// Landing peak when a chunk overshoots ±1.0 after gain. Just inside the
+    /// playback range so the rescaled chunk doesn't clip on quantization.
+    private static let overshootRescalePeak: Float = 0.99
 
     /// Gain ceiling for streaming normalization. Caps boost on quiet utterances
     /// so a near-silent first chunk doesn't blow up later content or noise.
@@ -422,21 +434,21 @@ public final class KokoroEngine: @unchecked Sendable {
     private static func computeStreamGain(from samples: [Float]) -> Float {
         var peak: Float = 0
         vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
-        guard peak > 0.001 else { return 1.0 }
-        let raw = Float(0.95) / peak
+        guard peak > silencePeakThreshold else { return 1.0 }
+        let raw = targetPeakAmplitude / peak
         return min(streamGainCeiling, max(streamGainFloor, raw))
     }
 
     /// Apply gain in-place. If the chunk peaks above 1.0 after gain, rescale
-    /// it to ±0.99 so the rare overshooting chunk lands inside the playback
-    /// range without per-sample clipping distortion.
+    /// it to ±overshootRescalePeak so the rare overshooting chunk lands inside
+    /// the playback range without per-sample clipping distortion.
     private static func applyStreamGain(_ samples: inout [Float], gain: Float) {
         var g = gain
         vDSP_vsmul(samples, 1, &g, &samples, 1, vDSP_Length(samples.count))
         var peak: Float = 0
         vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
         if peak > 1.0 {
-            var scale: Float = 0.99 / peak
+            var scale: Float = overshootRescalePeak / peak
             vDSP_vsmul(samples, 1, &scale, &samples, 1, vDSP_Length(samples.count))
         }
     }
@@ -449,19 +461,10 @@ public final class KokoroEngine: @unchecked Sendable {
 
     /// Fresh 100ms silence buffer for inter-chunk gaps. A new instance per
     /// call keeps `SpeakEvent.audio` buffers unaliased — concurrent or
-    /// retaining consumers never observe the same `AVAudioPCMBuffer`
-    /// scheduled on two player nodes at once.
+    /// retaining consumers never observe the same `AVAudioPCMBuffer` twice.
     private static func makeSilenceBuffer() -> AVAudioPCMBuffer? {
-        guard
-            let buffer = AVAudioPCMBuffer(
-                pcmFormat: audioFormat,
-                frameCapacity: AVAudioFrameCount(interChunkSilence))
-        else { return nil }
-        buffer.frameLength = AVAudioFrameCount(interChunkSilence)
-        if let channel = buffer.floatChannelData?[0] {
-            memset(channel, 0, interChunkSilence * MemoryLayout<Float>.stride)
-        }
-        return buffer
+        makePCMBuffer(
+            from: [Float](repeating: 0, count: interChunkSilence), format: audioFormat)
     }
 
     // MARK: - Voices
@@ -1059,10 +1062,16 @@ public final class KokoroEngine: @unchecked Sendable {
         standardFormatWithSampleRate: Double(sampleRate), channels: 1)!
 
     /// Stream synthesized audio as playback-ready buffers.
+    ///
+    /// `paceToRealtime`: when true (default), the producer thread sleeps after
+    /// each chunk to stay within `producerLeadSeconds` of a real-time
+    /// consumer — the right behavior for live playback. Set false for batch
+    /// consumers (file export, tests) that want full synthesis throughput.
     public func speak(
         _ text: String,
         voice: String,
-        speed: Float = 1.0
+        speed: Float = 1.0,
+        paceToRealtime: Bool = true
     ) throws -> AsyncStream<SpeakEvent> {
         guard availableVoices.contains(voice) else {
             throw KokoroError.voiceNotFound(voice)
@@ -1072,7 +1081,9 @@ public final class KokoroEngine: @unchecked Sendable {
         let (_, mergedIds) = prepareChunks(text: text)
         guard !mergedIds.isEmpty else { return AsyncStream { $0.finish() } }
 
-        return streamSpeakLoop(mergedIds: mergedIds, speed: clampedSpeed) { tokenCount in
+        return streamSpeakLoop(
+            mergedIds: mergedIds, speed: clampedSpeed, paceToRealtime: paceToRealtime
+        ) { tokenCount in
             try self.voiceStore.embedding(for: voice, tokenCount: tokenCount)
         }
     }
@@ -1081,13 +1092,16 @@ public final class KokoroEngine: @unchecked Sendable {
     public func speak(
         _ text: String,
         styleVector: [Float],
-        speed: Float = 1.0
+        speed: Float = 1.0,
+        paceToRealtime: Bool = true
     ) throws -> AsyncStream<SpeakEvent> {
         let clampedSpeed = Self.clampSpeed(speed)
         let (_, mergedIds) = prepareChunks(text: text)
         guard !mergedIds.isEmpty else { return AsyncStream { $0.finish() } }
 
-        return streamSpeakLoop(mergedIds: mergedIds, speed: clampedSpeed) { _ in
+        return streamSpeakLoop(
+            mergedIds: mergedIds, speed: clampedSpeed, paceToRealtime: paceToRealtime
+        ) { _ in
             styleVector
         }
     }
@@ -1098,6 +1112,7 @@ public final class KokoroEngine: @unchecked Sendable {
     private func streamSpeakLoop(
         mergedIds: [[Int]],
         speed: Float,
+        paceToRealtime: Bool,
         styleVectorFor: @escaping @Sendable (Int) throws -> [Float]
     ) -> AsyncStream<SpeakEvent> {
         return AsyncStream { continuation in
@@ -1105,18 +1120,14 @@ public final class KokoroEngine: @unchecked Sendable {
                 let format = Self.audioFormat
                 var streamGain: Float? = nil
                 var emittedFirst = false
-                let streamStart = Date()
+                let streamStart = CFAbsoluteTimeGetCurrent()
                 var audioProduced: TimeInterval = 0
 
                 for tokenIds in mergedIds {
                     if Thread.current.isCancelled { break }
 
-                    // Pace producer to within `producerLeadSeconds` of a real-time
-                    // consumer. Without this, fast synthesis on simulator/desktop
-                    // stuffs an unbounded number of AVAudioPCMBuffers into the
-                    // AsyncStream buffer and the consumer's player queue.
-                    if audioProduced > 0 {
-                        let lead = audioProduced - Date().timeIntervalSince(streamStart)
+                    if paceToRealtime {
+                        let lead = audioProduced - (CFAbsoluteTimeGetCurrent() - streamStart)
                         if lead > Self.producerLeadSeconds {
                             Thread.sleep(forTimeInterval: lead - Self.producerLeadSeconds)
                             if Thread.current.isCancelled { break }

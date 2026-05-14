@@ -82,7 +82,7 @@ enum MemoryTestRunner {
         recorder.event("case_start", detail: "\(voice)/\(label)")
 
         let stream = try await Task.detached(priority: .userInitiated) {
-            try engine.speak(text, voice: voice, speed: 1.0)
+            try engine.speak(text, voice: voice, speed: 1.0, paceToRealtime: false)
         }.value
 
         var bufferCount = 0
