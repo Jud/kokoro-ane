@@ -256,19 +256,21 @@ public final class KokoroEngine: @unchecked Sendable {
         for tokenIds in mergedIds {
             totalTokens += tokenIds.count
 
-            let styleVector = try voiceStore.embedding(
-                for: voice, tokenCount: tokenIds.count - 2)
+            try autoreleasepool {
+                let styleVector = try voiceStore.embedding(
+                    for: voice, tokenCount: tokenIds.count - 2)
 
-            var (samples, durations) = try synthesizeChunk(
-                tokenIds: tokenIds, styleVector: styleVector, speed: speed)
+                var (samples, durations) = try synthesizeChunk(
+                    tokenIds: tokenIds, styleVector: styleVector, speed: speed)
 
-            Self.applyFades(&samples)
-            if !allSamples.isEmpty {
-                allSamples.append(
-                    contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+                Self.applyFades(&samples)
+                if !allSamples.isEmpty {
+                    allSamples.append(
+                        contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+                }
+                allSamples.append(contentsOf: samples)
+                allDurations.append(contentsOf: durations)
             }
-            allSamples.append(contentsOf: samples)
-            allDurations.append(contentsOf: durations)
         }
 
         Self.postProcess(&allSamples)
@@ -292,16 +294,18 @@ public final class KokoroEngine: @unchecked Sendable {
         for tokenIds in mergedIds {
             totalTokens += tokenIds.count
 
-            var (samples, durations) = try synthesizeChunk(
-                tokenIds: tokenIds, styleVector: styleVector, speed: speed)
+            try autoreleasepool {
+                var (samples, durations) = try synthesizeChunk(
+                    tokenIds: tokenIds, styleVector: styleVector, speed: speed)
 
-            Self.applyFades(&samples)
-            if !allSamples.isEmpty {
-                allSamples.append(
-                    contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+                Self.applyFades(&samples)
+                if !allSamples.isEmpty {
+                    allSamples.append(
+                        contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+                }
+                allSamples.append(contentsOf: samples)
+                allDurations.append(contentsOf: durations)
             }
-            allSamples.append(contentsOf: samples)
-            allDurations.append(contentsOf: durations)
         }
 
         Self.postProcess(&allSamples)
@@ -351,8 +355,9 @@ public final class KokoroEngine: @unchecked Sendable {
 
     private static let hpAlpha: Float = 1.0 - (2.0 * .pi * 80.0 / Float(sampleRate))
 
-    /// Post-process audio in-place: high-pass filter, presence boost, peak normalize.
-    private static func postProcess(_ samples: inout [Float]) {
+    /// HP filter + presence-boost EQ. Precharges from the chunk head, so it's
+    /// safe to call per chunk without audible seams.
+    private static func applyFiltering(_ samples: inout [Float]) {
         guard samples.count > 1 else { return }
 
         let alpha = hpAlpha
@@ -387,13 +392,79 @@ public final class KokoroEngine: @unchecked Sendable {
             y2 = y1; y1 = y
             samples[i] = y
         }
+    }
+
+    /// Post-process audio in-place: high-pass filter, presence boost, peak normalize.
+    private static func postProcess(_ samples: inout [Float]) {
+        guard samples.count > 1 else { return }
+        applyFiltering(&samples)
 
         var peak: Float = 0
         vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
-        if peak > 0.001 {
-            var scale = Float(0.95) / peak
+        if peak > silencePeakThreshold {
+            var scale = targetPeakAmplitude / peak
             vDSP_vsmul(samples, 1, &scale, &samples, 1, vDSP_Length(samples.count))
         }
+    }
+
+    /// Target peak amplitude for normalized audio. Sits under 1.0 to leave
+    /// headroom against post-filter overshoot before the playback range.
+    private static let targetPeakAmplitude: Float = 0.95
+
+    /// Peak amplitude under which a chunk is treated as silent — skip gain
+    /// to avoid amplifying numerical noise.
+    private static let silencePeakThreshold: Float = 0.001
+
+    /// Landing peak when a chunk overshoots ±1.0 after gain. Just inside the
+    /// playback range so the rescaled chunk doesn't clip on quantization.
+    private static let overshootRescalePeak: Float = 0.99
+
+    /// Gain ceiling for streaming normalization. Caps boost on quiet utterances
+    /// so a near-silent first chunk doesn't blow up later content or noise.
+    private static let streamGainCeiling: Float = 2.0
+
+    /// Numerical floor on the computed gain. Set well under 1.0 so a chunk
+    /// louder than the target level can be attenuated, preserving headroom
+    /// for later chunks at risk of clipping.
+    private static let streamGainFloor: Float = 0.01
+
+    /// Compute fixed gain from a chunk's peak so all chunks in the stream use
+    /// the same scale — avoids the loudness jumps you'd get from per-chunk
+    /// peak normalization.
+    private static func computeStreamGain(from samples: [Float]) -> Float {
+        var peak: Float = 0
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
+        guard peak > silencePeakThreshold else { return 1.0 }
+        let raw = targetPeakAmplitude / peak
+        return min(streamGainCeiling, max(streamGainFloor, raw))
+    }
+
+    /// Apply gain in-place. If the chunk peaks above 1.0 after gain, rescale
+    /// it to ±overshootRescalePeak so the rare overshooting chunk lands inside
+    /// the playback range without per-sample clipping distortion.
+    private static func applyStreamGain(_ samples: inout [Float], gain: Float) {
+        var g = gain
+        vDSP_vsmul(samples, 1, &g, &samples, 1, vDSP_Length(samples.count))
+        var peak: Float = 0
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
+        if peak > 1.0 {
+            var scale: Float = overshootRescalePeak / peak
+            vDSP_vsmul(samples, 1, &scale, &samples, 1, vDSP_Length(samples.count))
+        }
+    }
+
+    /// Maximum seconds of audio the producer may sit ahead of a real-time
+    /// consumer before throttling. Bounds in-flight buffers across the
+    /// AsyncStream and any player queue for long utterances where synthesis
+    /// runs faster than playback.
+    private static let producerLeadSeconds: TimeInterval = 2.0
+
+    /// Fresh 100ms silence buffer for inter-chunk gaps. A new instance per
+    /// call keeps `SpeakEvent.audio` buffers unaliased — concurrent or
+    /// retaining consumers never observe the same `AVAudioPCMBuffer` twice.
+    private static func makeSilenceBuffer() -> AVAudioPCMBuffer? {
+        makePCMBuffer(
+            from: [Float](repeating: 0, count: interChunkSilence), format: audioFormat)
     }
 
     // MARK: - Voices
@@ -991,10 +1062,16 @@ public final class KokoroEngine: @unchecked Sendable {
         standardFormatWithSampleRate: Double(sampleRate), channels: 1)!
 
     /// Stream synthesized audio as playback-ready buffers.
+    ///
+    /// `paceToRealtime`: when true (default), the producer thread sleeps after
+    /// each chunk to stay within `producerLeadSeconds` of a real-time
+    /// consumer — the right behavior for live playback. Set false for batch
+    /// consumers (file export, tests) that want full synthesis throughput.
     public func speak(
         _ text: String,
         voice: String,
-        speed: Float = 1.0
+        speed: Float = 1.0,
+        paceToRealtime: Bool = true
     ) throws -> AsyncStream<SpeakEvent> {
         guard availableVoices.contains(voice) else {
             throw KokoroError.voiceNotFound(voice)
@@ -1004,39 +1081,10 @@ public final class KokoroEngine: @unchecked Sendable {
         let (_, mergedIds) = prepareChunks(text: text)
         guard !mergedIds.isEmpty else { return AsyncStream { $0.finish() } }
 
-        return AsyncStream { continuation in
-            let thread = Thread {
-                let format = Self.audioFormat
-
-                for tokenIds in mergedIds {
-                    if Thread.current.isCancelled { break }
-
-                    do {
-                        let styleVector = try self.voiceStore.embedding(
-                            for: voice, tokenCount: tokenIds.count - 2)
-
-                        var (samples, _) = try self.synthesizeChunk(
-                            tokenIds: tokenIds, styleVector: styleVector,
-                            speed: clampedSpeed)
-                        Self.applyFades(&samples)
-                        Self.postProcess(&samples)
-
-                        if let buffer = Self.makePCMBuffer(from: samples, format: format) {
-                            continuation.yield(.audio(buffer))
-                        }
-                    } catch {
-                        Self.logger.error(
-                            "Streaming chunk failed: \(error.localizedDescription)")
-                        continuation.yield(.chunkFailed(error))
-                    }
-                }
-
-                continuation.finish()
-            }
-            thread.stackSize = 8 * 1024 * 1024
-            nonisolated(unsafe) let unsafeThread = thread
-            continuation.onTermination = { _ in unsafeThread.cancel() }
-            thread.start()
+        return streamSpeakLoop(
+            mergedIds: mergedIds, speed: clampedSpeed, paceToRealtime: paceToRealtime
+        ) { tokenCount in
+            try self.voiceStore.embedding(for: voice, tokenCount: tokenCount)
         }
     }
 
@@ -1044,33 +1092,90 @@ public final class KokoroEngine: @unchecked Sendable {
     public func speak(
         _ text: String,
         styleVector: [Float],
-        speed: Float = 1.0
+        speed: Float = 1.0,
+        paceToRealtime: Bool = true
     ) throws -> AsyncStream<SpeakEvent> {
         let clampedSpeed = Self.clampSpeed(speed)
         let (_, mergedIds) = prepareChunks(text: text)
         guard !mergedIds.isEmpty else { return AsyncStream { $0.finish() } }
 
+        return streamSpeakLoop(
+            mergedIds: mergedIds, speed: clampedSpeed, paceToRealtime: paceToRealtime
+        ) { _ in
+            styleVector
+        }
+    }
+
+    /// Run the per-chunk synthesis loop on a worker thread and yield
+    /// playback-ready buffers. The style-vector source is parameterized so
+    /// both `speak` overloads share this implementation.
+    private func streamSpeakLoop(
+        mergedIds: [[Int]],
+        speed: Float,
+        paceToRealtime: Bool,
+        styleVectorFor: @escaping @Sendable (Int) throws -> [Float]
+    ) -> AsyncStream<SpeakEvent> {
         return AsyncStream { continuation in
-            let thread = Thread {
+            let thread = Thread { [self] in
                 let format = Self.audioFormat
+                var streamGain: Float? = nil
+                var emittedFirst = false
+                let streamStart = CFAbsoluteTimeGetCurrent()
+                var audioProduced: TimeInterval = 0
 
                 for tokenIds in mergedIds {
                     if Thread.current.isCancelled { break }
 
-                    do {
-                        var (samples, _) = try self.synthesizeChunk(
-                            tokenIds: tokenIds, styleVector: styleVector,
-                            speed: clampedSpeed)
-                        Self.applyFades(&samples)
-                        Self.postProcess(&samples)
-
-                        if let buffer = Self.makePCMBuffer(from: samples, format: format) {
-                            continuation.yield(.audio(buffer))
+                    if paceToRealtime {
+                        let lead = audioProduced - (CFAbsoluteTimeGetCurrent() - streamStart)
+                        if lead > Self.producerLeadSeconds {
+                            // Sleep in short increments so onTermination's
+                            // Thread.cancel() tears the worker down promptly
+                            // instead of waiting out the full pacing delay.
+                            let target =
+                                CFAbsoluteTimeGetCurrent()
+                                + (lead - Self.producerLeadSeconds)
+                            while !Thread.current.isCancelled {
+                                let remaining = target - CFAbsoluteTimeGetCurrent()
+                                if remaining <= 0 { break }
+                                Thread.sleep(forTimeInterval: min(0.05, remaining))
+                            }
+                            if Thread.current.isCancelled { break }
                         }
-                    } catch {
-                        Self.logger.error(
-                            "Streaming chunk failed: \(error.localizedDescription)")
-                        continuation.yield(.chunkFailed(error))
+                    }
+
+                    // Drain CoreML's autoreleased MLMultiArrays/NSError/etc. between
+                    // chunks. Without this, intermediates accumulate for the entire
+                    // utterance and peak memory scales linearly with chunk count.
+                    autoreleasepool {
+                        do {
+                            let styleVector = try styleVectorFor(tokenIds.count - 2)
+
+                            var (samples, _) = try synthesizeChunk(
+                                tokenIds: tokenIds, styleVector: styleVector, speed: speed)
+                            Self.applyFades(&samples)
+                            Self.applyFiltering(&samples)
+                            let gain = streamGain ?? Self.computeStreamGain(from: samples)
+                            streamGain = gain
+                            Self.applyStreamGain(&samples, gain: gain)
+
+                            if emittedFirst, let silence = Self.makeSilenceBuffer() {
+                                continuation.yield(.audio(silence))
+                                audioProduced +=
+                                    Double(silence.frameLength) / Double(Self.sampleRate)
+                            }
+
+                            if let buffer = Self.makePCMBuffer(from: samples, format: format) {
+                                continuation.yield(.audio(buffer))
+                                audioProduced +=
+                                    Double(buffer.frameLength) / Double(Self.sampleRate)
+                                emittedFirst = true
+                            }
+                        } catch {
+                            Self.logger.error(
+                                "Streaming chunk failed: \(error.localizedDescription)")
+                            continuation.yield(.chunkFailed(error))
+                        }
                     }
                 }
 
