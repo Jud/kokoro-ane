@@ -407,11 +407,14 @@ public final class KokoroEngine: @unchecked Sendable {
         }
     }
 
-    /// Gain ceiling for streaming normalization. Caps boost on quiet utterances.
+    /// Gain ceiling for streaming normalization. Caps boost on quiet utterances
+    /// so a near-silent first chunk doesn't blow up later content or noise.
     private static let streamGainCeiling: Float = 2.0
 
-    /// Gain floor for streaming normalization. Prevents attenuation of loud chunks.
-    private static let streamGainFloor: Float = 1.0
+    /// Numerical floor to keep gain finite. Below 1.0 so we can attenuate
+    /// when the first chunk is naturally louder than the target level —
+    /// preserves headroom for later chunks at risk of clipping.
+    private static let streamGainFloor: Float = 0.01
 
     /// Compute fixed gain from a chunk's peak so all chunks in the stream use
     /// the same scale — avoids the loudness jumps you'd get from per-chunk
@@ -424,13 +427,20 @@ public final class KokoroEngine: @unchecked Sendable {
         return min(streamGainCeiling, max(streamGainFloor, raw))
     }
 
-    /// Apply gain in-place and hard-clip to ±0.95.
+    /// Apply gain in-place. If a later chunk exceeds the first chunk's amplitude
+    /// after gain (rare for TTS but possible), rescale that chunk to ±0.99 peak
+    /// instead of hard-clipping every overshooting sample at ±0.95 — keeps the
+    /// chunk-to-chunk loudness mostly constant without introducing the audible
+    /// distortion the previous hard clip produced.
     private static func applyStreamGain(_ samples: inout [Float], gain: Float) {
         var g = gain
         vDSP_vsmul(samples, 1, &g, &samples, 1, vDSP_Length(samples.count))
-        var lo: Float = -0.95
-        var hi: Float = 0.95
-        vDSP_vclip(samples, 1, &lo, &hi, &samples, 1, vDSP_Length(samples.count))
+        var peak: Float = 0
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
+        if peak > 1.0 {
+            var scale: Float = 0.99 / peak
+            vDSP_vsmul(samples, 1, &scale, &samples, 1, vDSP_Length(samples.count))
+        }
     }
 
     /// Maximum seconds of audio the producer may sit ahead of a real-time
