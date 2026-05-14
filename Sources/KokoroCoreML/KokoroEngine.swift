@@ -411,9 +411,9 @@ public final class KokoroEngine: @unchecked Sendable {
     /// so a near-silent first chunk doesn't blow up later content or noise.
     private static let streamGainCeiling: Float = 2.0
 
-    /// Numerical floor to keep gain finite. Below 1.0 so we can attenuate
-    /// when the first chunk is naturally louder than the target level —
-    /// preserves headroom for later chunks at risk of clipping.
+    /// Numerical floor on the computed gain. Set well under 1.0 so a chunk
+    /// louder than the target level can be attenuated, preserving headroom
+    /// for later chunks at risk of clipping.
     private static let streamGainFloor: Float = 0.01
 
     /// Compute fixed gain from a chunk's peak so all chunks in the stream use
@@ -427,11 +427,9 @@ public final class KokoroEngine: @unchecked Sendable {
         return min(streamGainCeiling, max(streamGainFloor, raw))
     }
 
-    /// Apply gain in-place. If a later chunk exceeds the first chunk's amplitude
-    /// after gain (rare for TTS but possible), rescale that chunk to ±0.99 peak
-    /// instead of hard-clipping every overshooting sample at ±0.95 — keeps the
-    /// chunk-to-chunk loudness mostly constant without introducing the audible
-    /// distortion the previous hard clip produced.
+    /// Apply gain in-place. If the chunk peaks above 1.0 after gain, rescale
+    /// it to ±0.99 so the rare overshooting chunk lands inside the playback
+    /// range without per-sample clipping distortion.
     private static func applyStreamGain(_ samples: inout [Float], gain: Float) {
         var g = gain
         vDSP_vsmul(samples, 1, &g, &samples, 1, vDSP_Length(samples.count))
