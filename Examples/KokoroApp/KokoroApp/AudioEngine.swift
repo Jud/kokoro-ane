@@ -168,7 +168,7 @@ final class AudioEngine {
             buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack
         ) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.generation == myGeneration else { return }
                 self.queuedFrames -= frames
                 if self.queuedFrames <= self.maxQueuedFrames {
                     let cont = self.drainContinuation
