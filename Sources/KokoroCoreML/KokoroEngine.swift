@@ -447,9 +447,11 @@ public final class KokoroEngine: @unchecked Sendable {
     /// runs faster than playback.
     private static let producerLeadSeconds: TimeInterval = 2.0
 
-    /// Shared 100ms silence buffer for inter-chunk gaps. Read-only after init,
-    /// so it's safe to enqueue the same instance on the player node every call.
-    private static let interChunkSilenceBuffer: AVAudioPCMBuffer? = {
+    /// Fresh 100ms silence buffer for inter-chunk gaps. A new instance per
+    /// call keeps `SpeakEvent.audio` buffers unaliased — concurrent or
+    /// retaining consumers never observe the same `AVAudioPCMBuffer`
+    /// scheduled on two player nodes at once.
+    private static func makeSilenceBuffer() -> AVAudioPCMBuffer? {
         guard
             let buffer = AVAudioPCMBuffer(
                 pcmFormat: audioFormat,
@@ -460,7 +462,7 @@ public final class KokoroEngine: @unchecked Sendable {
             memset(channel, 0, interChunkSilence * MemoryLayout<Float>.stride)
         }
         return buffer
-    }()
+    }
 
     // MARK: - Voices
 
@@ -1136,7 +1138,7 @@ public final class KokoroEngine: @unchecked Sendable {
                             streamGain = gain
                             Self.applyStreamGain(&samples, gain: gain)
 
-                            if emittedFirst, let silence = Self.interChunkSilenceBuffer {
+                            if emittedFirst, let silence = Self.makeSilenceBuffer() {
                                 continuation.yield(.audio(silence))
                                 audioProduced +=
                                     Double(silence.frameLength) / Double(Self.sampleRate)
