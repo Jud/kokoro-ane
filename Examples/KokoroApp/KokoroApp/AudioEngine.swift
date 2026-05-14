@@ -17,6 +17,12 @@ final class AudioEngine {
     private var playerNode: AVAudioPlayerNode?
     private var streamTask: Task<Void, Never>?
     private var generation: UInt64 = 0
+    private var queuedFrames: AVAudioFramePosition = 0
+    private var drainContinuation: CheckedContinuation<Void, Never>?
+    private static let maxQueuedSeconds: Double = 2.0
+    private var maxQueuedFrames: AVAudioFramePosition {
+        AVAudioFramePosition(Self.maxQueuedSeconds * Double(KokoroEngine.sampleRate))
+    }
     private var _analyzer: SpectrumAnalyzer?
     private var spectrumAnalyzer: SpectrumAnalyzer {
         if let a = _analyzer { return a }
@@ -104,7 +110,7 @@ final class AudioEngine {
                     self.isSynthesizing = false
                     self.isPlaying = true
                 }
-                player.scheduleBuffer(buffer, completionHandler: nil)
+                await enqueue(buffer: buffer, on: player, generation: myGeneration)
             case .chunkFailed(let err):
                 self.error = "Chunk failed: \(err.localizedDescription)"
             }
@@ -145,6 +151,34 @@ final class AudioEngine {
         return player
     }
 
+    private func enqueue(
+        buffer: AVAudioPCMBuffer, on player: AVAudioPlayerNode, generation myGeneration: UInt64
+    ) async {
+        let frames = AVAudioFramePosition(buffer.frameLength)
+        while self.generation == myGeneration, !Task.isCancelled,
+            queuedFrames > maxQueuedFrames
+        {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                drainContinuation = cont
+            }
+        }
+        guard self.generation == myGeneration, !Task.isCancelled else { return }
+        queuedFrames += frames
+        player.scheduleBuffer(
+            buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.queuedFrames -= frames
+                if self.queuedFrames <= self.maxQueuedFrames {
+                    let cont = self.drainContinuation
+                    self.drainContinuation = nil
+                    cont?.resume()
+                }
+            }
+        }
+    }
+
     private func scheduleEndSentinel(on player: AVAudioPlayerNode, generation myGeneration: UInt64) {
         guard
             let sentinel = AVAudioPCMBuffer(
@@ -166,6 +200,10 @@ final class AudioEngine {
     }
 
     private func teardown() {
+        let pending = drainContinuation
+        drainContinuation = nil
+        pending?.resume()
+        queuedFrames = 0
         playerNode?.removeTap(onBus: 0)
         playerNode?.stop()
         avEngine?.stop()

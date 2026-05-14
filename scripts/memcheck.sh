@@ -41,7 +41,9 @@ DEVICE_NAME="${DEVICE_NAME:-iPhone SE (3rd generation)}"
 PEAK_MB="${PEAK_MB:-4500}"
 DELTA_MB="${DELTA_MB:-4500}"
 LEAK_MB="${LEAK_MB:-150}"
-TIMEOUT_S="${TIMEOUT_S:-180}"
+# Producer paces to ~real-time, so wall time ≈ total synthesized audio
+# duration (~4 minutes for the default 3×3 suite).
+TIMEOUT_S="${TIMEOUT_S:-480}"
 XCTRACE="${XCTRACE:-0}"
 ARTIFACTS_DIR="${REPO_ROOT}/.memcheck"
 mkdir -p "$ARTIFACTS_DIR"

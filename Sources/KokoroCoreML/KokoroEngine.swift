@@ -433,6 +433,12 @@ public final class KokoroEngine: @unchecked Sendable {
         vDSP_vclip(samples, 1, &lo, &hi, &samples, 1, vDSP_Length(samples.count))
     }
 
+    /// Maximum seconds of audio the producer may sit ahead of a real-time
+    /// consumer before throttling. Bounds in-flight buffers across the
+    /// AsyncStream and any player queue for long utterances where synthesis
+    /// runs faster than playback.
+    private static let producerLeadSeconds: TimeInterval = 2.0
+
     /// Shared 100ms silence buffer for inter-chunk gaps. Read-only after init,
     /// so it's safe to enqueue the same instance on the player node every call.
     private static let interChunkSilenceBuffer: AVAudioPCMBuffer? = {
@@ -1089,9 +1095,23 @@ public final class KokoroEngine: @unchecked Sendable {
                 let format = Self.audioFormat
                 var streamGain: Float? = nil
                 var emittedFirst = false
+                let streamStart = Date()
+                var audioProduced: TimeInterval = 0
 
                 for tokenIds in mergedIds {
                     if Thread.current.isCancelled { break }
+
+                    // Pace producer to within `producerLeadSeconds` of a real-time
+                    // consumer. Without this, fast synthesis on simulator/desktop
+                    // stuffs an unbounded number of AVAudioPCMBuffers into the
+                    // AsyncStream buffer and the consumer's player queue.
+                    if audioProduced > 0 {
+                        let lead = audioProduced - Date().timeIntervalSince(streamStart)
+                        if lead > Self.producerLeadSeconds {
+                            Thread.sleep(forTimeInterval: lead - Self.producerLeadSeconds)
+                            if Thread.current.isCancelled { break }
+                        }
+                    }
 
                     // Drain CoreML's autoreleased MLMultiArrays/NSError/etc. between
                     // chunks. Without this, intermediates accumulate for the entire
@@ -1110,10 +1130,14 @@ public final class KokoroEngine: @unchecked Sendable {
 
                             if emittedFirst, let silence = Self.interChunkSilenceBuffer {
                                 continuation.yield(.audio(silence))
+                                audioProduced +=
+                                    Double(silence.frameLength) / Double(Self.sampleRate)
                             }
 
                             if let buffer = Self.makePCMBuffer(from: samples, format: format) {
                                 continuation.yield(.audio(buffer))
+                                audioProduced +=
+                                    Double(buffer.frameLength) / Double(Self.sampleRate)
                                 emittedFirst = true
                             }
                         } catch {
